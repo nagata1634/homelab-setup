@@ -1,4 +1,5 @@
 ﻿#requires -Version 5.1
+# v2: add stage4 dev tools (Node/Java/Rust/Python + CLI tools)
 <#
 .SYNOPSIS
   Windows homelab phase-1 setup: WSL2 + Docker Desktop + buildx multi-arch.
@@ -146,6 +147,52 @@ function Enable-FeatureIfNeeded {
   Write-Info "Enabling $Name"
   Enable-WindowsOptionalFeature -Online -FeatureName $Name -All -NoRestart -ErrorAction Stop | Out-Null
   return $true
+}
+
+function Install-WingetPackage {
+  param(
+    [Parameter(Mandatory)][string]$Id,
+    [ValidateSet('user','machine')][string]$Scope = 'machine',
+    [string]$Override = $null,
+    [int]$MaxAttempts = 3
+  )
+  # Check if already installed (idempotent)
+  try {
+    $listOut = & winget list --id $Id -e --accept-source-agreements 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0 -and $listOut -match [Regex]::Escape($Id)) {
+      Write-Ok "  [skip] $Id already installed"
+      return $true
+    }
+  } catch {}
+
+  $scopes = @($Scope)
+  if ($Scope -eq 'machine') { $scopes += 'user' }  # fallback to user if machine fails
+
+  foreach ($sc in $scopes) {
+    for ($i = 1; $i -le $MaxAttempts; $i++) {
+      Write-Info ("  [install] {0} (scope={1}, attempt {2}/{3})" -f $Id, $sc, $i, $MaxAttempts)
+      $cliArgs = @('install','--id',$Id,'-e','--silent','--accept-package-agreements','--accept-source-agreements','--scope',$sc)
+      if ($Override) { $cliArgs += @('--override',$Override) }
+      try {
+        & winget @cliArgs 2>&1 | ForEach-Object {
+          Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8
+        }
+        $code = $LASTEXITCODE
+        # 0 = ok, -1978335189 (0x8A15002B) = already installed
+        if ($code -eq 0 -or $code -eq -1978335189) {
+          Write-Ok ("  [done] {0} (scope={1})" -f $Id, $sc)
+          return $true
+        }
+        Write-Warn2 ("  attempt {0} failed (exit={1})" -f $i, $code)
+      } catch {
+        Write-Warn2 ("  attempt {0} exception: {1}" -f $i, $_.Exception.Message)
+      }
+      Start-Sleep -Seconds 5
+    }
+    Write-Warn2 ("  scope={0} failed after {1} attempts" -f $sc, $MaxAttempts)
+  }
+  Write-Warn2 ("  [FAIL] {0}" -f $Id)
+  return $false
 }
 
 # ============================================================
@@ -349,8 +396,320 @@ $wslVer
   $resultFile = Join-Path $env:USERPROFILE 'Desktop\homelab-setup-result.txt'
   $summary | Set-Content -Path $resultFile -Encoding UTF8
 
+  Save-State -State $State -Stage 'stage4'
+  Unregister-ResumeTask
+}
+
+# ============================================================
+# Stage 4: dev environment (winget + Node/Java/Rust/Python + CLI tools)
+# ============================================================
+function Invoke-Stage4 {
+  param($State)
+  Write-Info '=== Stage 4: dev environment via winget ==='
+
+  # ---------- 4-1. winget availability ----------
+  Write-Info '--- 4-1. winget availability ---'
+  try {
+    $wingetVer = & winget --version 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "winget --version exit code $LASTEXITCODE" }
+    Write-Ok ("winget detected: {0}" -f ($wingetVer -join ' '))
+  } catch {
+    Write-Err 'winget is not available on this machine.'
+    Write-Err 'Required: Windows 10 1809 or later, plus Microsoft Store > "App Installer".'
+    Write-Err 'Install App Installer from the Microsoft Store, then re-run this script.'
+    throw 'winget missing - cannot continue stage4'
+  }
+
+  function Update-PathFromMachineAndUser {
+    $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
+  }
+
+  # ---------- 4-2. winget bulk install ----------
+  Write-Info '--- 4-2. winget bulk install ---'
+  $prevEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+
+  # ordered list of (id, scope, override)
+  $pkgList = @(
+    @{ Id = 'Git.Git';                                 Scope = 'machine' }
+    @{ Id = 'GitHub.cli';                              Scope = 'machine' }
+    @{ Id = 'Microsoft.WindowsTerminal';               Scope = 'machine' }
+    @{ Id = 'Microsoft.PowerShell';                    Scope = 'machine' }
+    @{ Id = 'Microsoft.VisualStudioCode';              Scope = 'user'    }   # VS Code: user scope forced
+    @{ Id = '7zip.7zip';                               Scope = 'machine' }
+    @{ Id = 'Schniz.fnm';                              Scope = 'machine' }   # Node version manager
+    @{ Id = 'Microsoft.OpenJDK.21';                    Scope = 'machine' }   # Java
+    @{ Id = 'Apache.Maven';                            Scope = 'machine' }
+    @{ Id = 'Microsoft.VisualStudio.2022.BuildTools';  Scope = 'machine'; Override = '--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --includeRecommended' }
+    @{ Id = 'Rustlang.Rustup';                         Scope = 'machine' }
+    @{ Id = 'Python.Python.3.12';                      Scope = 'machine' }
+    @{ Id = 'astral-sh.uv';                            Scope = 'machine' }
+    @{ Id = 'BurntSushi.ripgrep.MSVC';                 Scope = 'machine' }
+    @{ Id = 'sharkdp.fd';                              Scope = 'machine' }
+    @{ Id = 'sharkdp.bat';                             Scope = 'machine' }
+    @{ Id = 'junegunn.fzf';                            Scope = 'machine' }
+    @{ Id = 'jqlang.jq';                               Scope = 'machine' }
+    @{ Id = 'dandavison.delta';                        Scope = 'machine' }
+    @{ Id = 'Starship.Starship';                       Scope = 'machine' }
+  )
+
+  $failed = @()
+  foreach ($pkg in $pkgList) {
+    $ovr = if ($pkg.ContainsKey('Override')) { $pkg.Override } else { $null }
+    $ok = $false
+    try {
+      $ok = Install-WingetPackage -Id $pkg.Id -Scope $pkg.Scope -Override $ovr
+    } catch {
+      Write-Warn2 ("install exception for {0}: {1}" -f $pkg.Id, $_.Exception.Message)
+      $ok = $false
+    }
+    if (-not $ok) { $failed += $pkg.Id }
+    Update-PathFromMachineAndUser
+  }
+
+  $ErrorActionPreference = $prevEAP
+
+  if ($failed.Count -gt 0) {
+    Write-Warn2 ('--- failed packages ({0}) ---' -f $failed.Count)
+    foreach ($f in $failed) { Write-Warn2 ("  - {0}" -f $f) }
+  } else {
+    Write-Ok 'all winget packages installed (or already present)'
+  }
+
+  # ---------- 4-3. language-specific setup ----------
+  Write-Info '--- 4-3. language-specific setup ---'
+  Update-PathFromMachineAndUser
+
+  # ----- Node.js (fnm) -----
+  Write-Info '[Node.js] configuring fnm + LTS'
+  try {
+    $pwsh7Profile = Join-Path $env:USERPROFILE 'Documents\PowerShell\Microsoft.PowerShell_profile.ps1'
+    $pwsh7Dir = Split-Path $pwsh7Profile -Parent
+    if (-not (Test-Path $pwsh7Dir)) {
+      New-Item -ItemType Directory -Path $pwsh7Dir -Force | Out-Null
+    }
+    $fnmInitLine = 'fnm env --use-on-cd --shell powershell | Out-String | Invoke-Expression'
+    $existing = if (Test-Path $pwsh7Profile) { Get-Content $pwsh7Profile -Raw -Encoding UTF8 } else { '' }
+    if ($existing -notmatch [Regex]::Escape('fnm env --use-on-cd')) {
+      Add-Content -Path $pwsh7Profile -Value "`r`n# fnm (Node.js) shell init`r`n$fnmInitLine`r`n" -Encoding UTF8
+      Write-Ok "fnm init line appended to $pwsh7Profile"
+    } else {
+      Write-Ok 'fnm init line already present in PowerShell 7 profile'
+    }
+  } catch {
+    Write-Warn2 ("fnm profile update warning: {0}" -f $_.Exception.Message)
+  }
+
+  Update-PathFromMachineAndUser
+  try {
+    $fnmExe = (Get-Command fnm -ErrorAction SilentlyContinue)
+    if ($fnmExe) {
+      Write-Info 'fnm install --lts'
+      & fnm install --lts 2>&1 | ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+      & fnm use lts-latest 2>&1 | ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+      & fnm default lts-latest 2>&1 | ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+      Write-Ok 'fnm LTS installed and set as default'
+      # eval fnm env into current shell so node/npm are visible
+      try {
+        $fnmEnv = & fnm env --shell powershell 2>$null
+        if ($fnmEnv) { $fnmEnv | Out-String | Invoke-Expression }
+      } catch {}
+      try {
+        Write-Info 'npm install -g pnpm'
+        & npm install -g pnpm 2>&1 | ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+        if ($LASTEXITCODE -ne 0) { Write-Warn2 'pnpm install non-zero exit (continuing)' } else { Write-Ok 'pnpm installed' }
+      } catch {
+        Write-Warn2 ("pnpm install warning: {0}" -f $_.Exception.Message)
+      }
+    } else {
+      Write-Warn2 'fnm not on PATH yet - LTS install skipped (re-run after new shell)'
+    }
+  } catch {
+    Write-Warn2 ("Node setup warning: {0}" -f $_.Exception.Message)
+  }
+
+  # ----- Java -----
+  Write-Info '[Java] setting JAVA_HOME'
+  try {
+    $javaHome = $null
+    try {
+      $javaHome = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\JDK\hotspot\MSI' 'Path' -ErrorAction Stop
+    } catch {
+      $cand = Get-ChildItem 'C:\Program Files\Microsoft\jdk-*' -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1
+      if ($cand) { $javaHome = $cand.FullName }
+    }
+    if ($javaHome) {
+      [System.Environment]::SetEnvironmentVariable('JAVA_HOME', $javaHome, 'Machine')
+      $env:JAVA_HOME = $javaHome
+      Write-Ok ("JAVA_HOME set to {0}" -f $javaHome)
+    } else {
+      Write-Warn2 'JDK 21 install path not found - JAVA_HOME not set'
+    }
+  } catch {
+    Write-Warn2 ("JAVA_HOME setup warning: {0}" -f $_.Exception.Message)
+  }
+  Update-PathFromMachineAndUser
+  try {
+    $javaOut = & java -version 2>&1
+    Write-Info ("java -version: {0}" -f ($javaOut -join ' | '))
+  } catch {
+    Write-Warn2 'java not on PATH yet (new shell may be required)'
+  }
+
+  # ----- Rust -----
+  Write-Info '[Rust] running rustup-init'
+  Update-PathFromMachineAndUser
+  try {
+    $rustupInit = (Get-Command rustup-init.exe -ErrorAction SilentlyContinue)
+    if ($rustupInit) {
+      & rustup-init.exe -y --default-toolchain stable --profile default 2>&1 |
+        ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+      Write-Ok 'rustup-init completed'
+    } else {
+      Write-Warn2 'rustup-init.exe not on PATH - skipping (Rustup install may have failed)'
+    }
+    # PATH reload: ~/.cargo/bin
+    $cargoBin = Join-Path $env:USERPROFILE '.cargoin'
+    if (Test-Path $cargoBin) { $env:Path = "$cargoBin;$env:Path" }
+    Update-PathFromMachineAndUser
+    try {
+      $cargoVer = & cargo --version 2>&1
+      Write-Ok ("cargo: {0}" -f ($cargoVer -join ' '))
+    } catch {
+      Write-Warn2 'cargo not callable yet'
+    }
+    try {
+      & rustup component add rust-analyzer 2>&1 |
+        ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+      Write-Ok 'rust-analyzer component added'
+    } catch {
+      Write-Warn2 ("rust-analyzer add warning: {0}" -f $_.Exception.Message)
+    }
+  } catch {
+    Write-Warn2 ("Rust setup warning: {0}" -f $_.Exception.Message)
+  }
+
+  # ----- Python -----
+  Write-Info '[Python] checking python 3.12 / uv'
+  Update-PathFromMachineAndUser
+  try {
+    $pyVer = & python --version 2>&1
+    Write-Info ("python: {0}" -f ($pyVer -join ' '))
+  } catch {
+    Write-Warn2 'python not on PATH yet'
+  }
+  try {
+    $uvVer = & uv --version 2>&1
+    Write-Info ("uv: {0}" -f ($uvVer -join ' '))
+  } catch {
+    Write-Warn2 'uv not on PATH yet'
+  }
+  try {
+    & python -m ensurepip --upgrade 2>&1 |
+      ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+  } catch {
+    Write-Warn2 ("ensurepip warning: {0}" -f $_.Exception.Message)
+  }
+
+  # ---------- 4-4. VS Code extensions ----------
+  Write-Info '--- 4-4. VS Code extensions ---'
+  Update-PathFromMachineAndUser
+  $codeCmd = Get-Command code -ErrorAction SilentlyContinue
+  if (-not $codeCmd) {
+    # try the well-known user-scope install location
+    $codeCandidate = Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Codein\code.cmd'
+    if (Test-Path $codeCandidate) { $codeCmd = $codeCandidate }
+  }
+  if ($codeCmd) {
+    $extensions = @(
+      'ms-vscode-remote.remote-wsl',
+      'ms-python.python',
+      'ms-python.vscode-pylance',
+      'rust-lang.rust-analyzer',
+      'vscjava.vscode-java-pack',
+      'ms-azuretools.vscode-docker',
+      'dbaeumer.vscode-eslint',
+      'esbenp.prettier-vscode',
+      'eamodio.gitlens',
+      'editorconfig.editorconfig'
+    )
+    foreach ($ext in $extensions) {
+      try {
+        Write-Info ("  code --install-extension {0}" -f $ext)
+        & code --install-extension $ext --force 2>&1 |
+          ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+      } catch {
+        Write-Warn2 ("  ext install warning ({0}): {1}" -f $ext, $_.Exception.Message)
+      }
+    }
+    Write-Ok 'VS Code extensions install attempted'
+  } else {
+    Write-Warn2 'code CLI not found - VS Code extensions skipped'
+  }
+
+  # ---------- 4-5. final summary ----------
+  Write-Info '--- 4-5. final summary ---'
+  Update-PathFromMachineAndUser
+
+  function Get-CmdVersion {
+    param([string]$Exe, [string[]]$Args = @('--version'))
+    try {
+      $out = & $Exe @Args 2>&1
+      return (($out | Select-Object -First 3) -join ' | ')
+    } catch {
+      return '(not available)'
+    }
+  }
+
+  $vers = [ordered]@{}
+  $vers['git']     = Get-CmdVersion -Exe 'git'
+  $vers['gh']      = Get-CmdVersion -Exe 'gh'
+  $vers['code']    = Get-CmdVersion -Exe 'code'
+  $vers['fnm']     = Get-CmdVersion -Exe 'fnm'
+  $vers['node']    = Get-CmdVersion -Exe 'node'
+  $vers['npm']     = Get-CmdVersion -Exe 'npm'
+  $vers['pnpm']    = Get-CmdVersion -Exe 'pnpm'
+  $vers['java']    = Get-CmdVersion -Exe 'java' -Args @('-version')
+  $vers['mvn']     = Get-CmdVersion -Exe 'mvn'
+  $vers['rustc']   = Get-CmdVersion -Exe 'rustc'
+  $vers['cargo']   = Get-CmdVersion -Exe 'cargo'
+  $vers['python']  = Get-CmdVersion -Exe 'python'
+  $vers['uv']      = Get-CmdVersion -Exe 'uv'
+  $vers['rg']      = Get-CmdVersion -Exe 'rg'
+  $vers['fd']      = Get-CmdVersion -Exe 'fd'
+  $vers['bat']     = Get-CmdVersion -Exe 'bat'
+  $vers['fzf']     = Get-CmdVersion -Exe 'fzf'
+  $vers['jq']      = Get-CmdVersion -Exe 'jq'
+  $vers['delta']   = Get-CmdVersion -Exe 'delta'
+  $vers['starship']= Get-CmdVersion -Exe 'starship'
+
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.AppendLine('')
+  [void]$sb.AppendLine('================================================================')
+  [void]$sb.AppendLine(' Stage 4 dev environment  SUCCESS')
+  [void]$sb.AppendLine('================================================================')
+  foreach ($k in $vers.Keys) {
+    [void]$sb.AppendLine(('  {0,-10}: {1}' -f $k, $vers[$k]))
+  }
+  if ($failed.Count -gt 0) {
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine(' Failed winget packages:')
+    foreach ($f in $failed) { [void]$sb.AppendLine(('   - {0}' -f $f)) }
+  }
+  [void]$sb.AppendLine('================================================================')
+  $summary4 = $sb.ToString()
+  Write-Host $summary4 -ForegroundColor Green
+  Add-Content -Path $Script:LogPath -Value $summary4 -Encoding UTF8
+
+  # append to desktop result file (stage3 already wrote stage1-3 result)
+  $resultFile = Join-Path $env:USERPROFILE 'Desktop\homelab-setup-result.txt'
+  Add-Content -Path $resultFile -Value $summary4 -Encoding UTF8
+
+  # mark completion
   Save-State -State $State -Stage 'done'
   Unregister-ResumeTask
+  Write-Ok 'Stage 4 done. Setup fully complete.'
 }
 
 # ============================================================
@@ -374,20 +733,27 @@ try {
   $state = Get-State
   Write-Info ("Current stage: {0}" -f $state.stage)
 
-  switch ($state.stage) {
-    'stage1' { Invoke-Stage1 -State $state }
-    'stage2' { Invoke-Stage2 -State $state }
-    'stage3' { Invoke-Stage3 -State $state }
-    'done'   {
-      Write-Ok 'Setup already complete. Nothing to do.'
-      Unregister-ResumeTask
+  # Loop so non-rebooting stages (3 -> 4 -> done) chain in one invocation.
+  # Stages 1 and 2 reboot via Restart-Computer, so the loop terminates there anyway.
+  do {
+    $loopState = Get-State
+    switch ($loopState.stage) {
+      'stage1' { Invoke-Stage1 -State $loopState }
+      'stage2' { Invoke-Stage2 -State $loopState }
+      'stage3' { Invoke-Stage3 -State $loopState }
+      'stage4' { Invoke-Stage4 -State $loopState }
+      'done'   {
+        Write-Ok 'Setup already complete. Nothing to do.'
+        Unregister-ResumeTask
+      }
+      default {
+        Write-Warn2 ("Unknown stage '{0}', restarting from stage1" -f $loopState.stage)
+        $loopState.stage = 'stage1'
+        Invoke-Stage1 -State $loopState
+      }
     }
-    default {
-      Write-Warn2 ("Unknown stage '{0}', restarting from stage1" -f $state.stage)
-      $state.stage = 'stage1'
-      Invoke-Stage1 -State $state
-    }
-  }
+    $loopState = Get-State
+  } while ($loopState.stage -notin @('done') -and $loopState.stage -notmatch '_failed$')
 }
 catch {
   Write-Err ("FATAL: {0}" -f $_.Exception.Message)
