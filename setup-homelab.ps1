@@ -533,7 +533,7 @@ function Invoke-Stage4 {
   try {
     $javaHome = $null
     try {
-      $javaHome = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\JDK\hotspot\MSI' 'Path' -ErrorAction Stop
+      $javaHome = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\JDK\21\hotspot\MSI' 'Path' -ErrorAction Stop
     } catch {
       $cand = Get-ChildItem 'C:\Program Files\Microsoft\jdk-*' -Directory -ErrorAction SilentlyContinue |
         Sort-Object Name -Descending | Select-Object -First 1
@@ -570,7 +570,7 @@ function Invoke-Stage4 {
       Write-Warn2 'rustup-init.exe not on PATH - skipping (Rustup install may have failed)'
     }
     # PATH reload: ~/.cargo/bin
-    $cargoBin = Join-Path $env:USERPROFILE '.cargoin'
+    $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
     if (Test-Path $cargoBin) { $env:Path = "$cargoBin;$env:Path" }
     Update-PathFromMachineAndUser
     try {
@@ -618,7 +618,7 @@ function Invoke-Stage4 {
   $codeCmd = Get-Command code -ErrorAction SilentlyContinue
   if (-not $codeCmd) {
     # try the well-known user-scope install location
-    $codeCandidate = Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Codein\code.cmd'
+    $codeCandidate = Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Code\bin\code.cmd'
     if (Test-Path $codeCandidate) { $codeCmd = $codeCandidate }
   }
   if ($codeCmd) {
