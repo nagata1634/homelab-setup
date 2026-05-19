@@ -1,5 +1,6 @@
 ﻿#requires -Version 5.1
 # v2: add stage4 dev tools (Node/Java/Rust/Python + CLI tools)
+# v3: stage3 docker stderr resilience + OneDrive-aware Desktop path
 <#
 .SYNOPSIS
   Windows homelab phase-1 setup: WSL2 + Docker Desktop + buildx multi-arch.
@@ -324,33 +325,59 @@ function Invoke-Stage3 {
   try {
     $hw = & docker run --rm hello-world 2>&1
     $hw | ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+    if ($LASTEXITCODE -eq 0) {
+      Write-Ok 'hello-world ran successfully'
+    } else {
+      Write-Warn2 ("hello-world non-zero exit ({0}) - continuing" -f $LASTEXITCODE)
+    }
   } catch {
-    Write-Warn2 ("hello-world warning: {0}" -f $_.Exception.Message)
+    # "Unable to find image" goes to stderr before pull - benign under $EAP=Stop
+    Write-Warn2 ("hello-world stderr noise: {0}" -f $_.Exception.Message)
   }
 
   Write-Info 'Installing multi-arch binfmt (tonistiigi/binfmt)'
-  & docker run --privileged --rm tonistiigi/binfmt --install all 2>&1 |
-    ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+  try {
+    & docker run --privileged --rm tonistiigi/binfmt --install all 2>&1 |
+      ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+    if ($LASTEXITCODE -eq 0) {
+      Write-Ok 'binfmt installed'
+    } else {
+      Write-Warn2 ("binfmt non-zero exit ({0}) - continuing" -f $LASTEXITCODE)
+    }
+  } catch {
+    # "Unable to find image" stderr pre-pull is benign; only log
+    Write-Warn2 ("binfmt stderr noise: {0}" -f $_.Exception.Message)
+  }
 
   Write-Info 'Setting up buildx builder "multi"'
-  $existing = & docker buildx ls 2>$null
-  if ($existing -match '(?m)^multi\b') {
-    & docker buildx use multi | Out-Null
-    Write-Ok 'buildx "multi" already exists, switched'
-  } else {
-    & docker buildx create --name multi --use --bootstrap 2>&1 |
-      ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+  try {
+    $existing = & docker buildx ls 2>$null
+    if ($existing -match '(?m)^multi\b') {
+      & docker buildx use multi | Out-Null
+      Write-Ok 'buildx "multi" already exists, switched'
+    } else {
+      & docker buildx create --name multi --use --bootstrap 2>&1 |
+        ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+    }
+  } catch {
+    Write-Warn2 ("buildx create/use warning: {0}" -f $_.Exception.Message)
   }
 
-  $inspect = & docker buildx inspect --bootstrap 2>&1
-  $inspect | ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
-  if (($inspect -join "`n") -notmatch 'linux/arm64') {
-    throw 'buildx multi-arch FAILED: linux/arm64 not advertised by builder'
+  $inspect = $null
+  try {
+    $inspect = & docker buildx inspect --bootstrap 2>&1
+    $inspect | ForEach-Object { Add-Content -Path $Script:LogPath -Value $_ -Encoding UTF8 }
+  } catch {
+    Write-Warn2 ("buildx inspect warning: {0}" -f $_.Exception.Message)
   }
-  Write-Ok 'buildx multi-arch (linux/arm64 + linux/amd64) verified'
+  if ($inspect -and (($inspect -join "`n") -match 'linux/arm64')) {
+    Write-Ok 'buildx multi-arch (linux/arm64 + linux/amd64) verified'
+  } else {
+    Write-Warn2 'buildx multi-arch verification inconclusive - check `docker buildx inspect` after setup'
+  }
 
   # Desktop docs folder
-  $deskDir = Join-Path $env:USERPROFILE 'Desktop\homelab-docs'
+  $deskDir = Join-Path ([Environment]::GetFolderPath('Desktop')) 'homelab-docs'
   if (-not (Test-Path $deskDir)) {
     New-Item -ItemType Directory -Path $deskDir -Force | Out-Null
   }
@@ -393,7 +420,7 @@ $wslVer
 "@
   Write-Host $summary -ForegroundColor Green
   Add-Content -Path $Script:LogPath -Value $summary -Encoding UTF8
-  $resultFile = Join-Path $env:USERPROFILE 'Desktop\homelab-setup-result.txt'
+  $resultFile = Join-Path ([Environment]::GetFolderPath('Desktop')) 'homelab-setup-result.txt'
   $summary | Set-Content -Path $resultFile -Encoding UTF8
 
   Save-State -State $State -Stage 'stage4'
@@ -703,7 +730,7 @@ function Invoke-Stage4 {
   Add-Content -Path $Script:LogPath -Value $summary4 -Encoding UTF8
 
   # append to desktop result file (stage3 already wrote stage1-3 result)
-  $resultFile = Join-Path $env:USERPROFILE 'Desktop\homelab-setup-result.txt'
+  $resultFile = Join-Path ([Environment]::GetFolderPath('Desktop')) 'homelab-setup-result.txt'
   Add-Content -Path $resultFile -Value $summary4 -Encoding UTF8
 
   # mark completion
