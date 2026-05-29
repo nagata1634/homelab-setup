@@ -347,21 +347,54 @@ Phase 2.x or Phase 3 で順次取り込み。
 
 ### 13.5 WireGuard と Kerberos の現実的な組み合わせ案
 
-WireGuard を **「LAN を超えた経路の暗号化」** に使い、その上の各サービスを Kerberize する **二層構成** が実用的。
+WireGuard を **「LAN を超えた経路の暗号化 / 外出先からの帰宅トンネル」** に使い、その上の各サービスを Kerberize する **二層構成** が実用的。
 
+#### 想定トポロジ (Road Warrior + Full Tunnel)
 ```
-外出先クライアント
-   │
-   │  ① WireGuard (静的鍵、家庭ルータで終端) ─── 通信路の暗号化
-   ▼
-家庭 LAN
-   │
-   ▼
-   ② SSH/NFS/SMB/HTTP (Kerberos)  ─── ユーザ認証 + 透過 SSO
+[外出先 PC] ── 公衆 Wi-Fi (untrusted) ── Internet
+     │                                       │
+     │  ① WireGuard tunnel (UDP 51820)        │
+     │     AllowedIPs = 0.0.0.0/0             │
+     │     (=全トラフィックをトンネル経由)    │
+     ▼                                       ▼
+        ┌────────────────────────────────────────┐
+        │  自宅ルータ or TS-233 (WG サーバ)       │
+        │  - WireGuard endpoint                  │
+        │  - NAT で LAN / Internet にルーティング │
+        └────────────────────────────────────────┘
+                          │
+                          ▼
+        ┌────────────────────────────────────────┐
+        │  自宅 LAN (Kerberos / NFS / SMB / DNS)  │
+        │  ② サービスは全て Kerberos 認証         │
+        └────────────────────────────────────────┘
 ```
 
-- WireGuard の鍵管理: AD の `pwdLastSet` 連動などはできないため、**LDAP 属性 `wireguardPublicKey` を独自スキーマで追加** し、admin スクリプトでピア構成を生成・配布する運用が現実解。
+#### 効果
+| 効果 | 内容 |
+|------|------|
+| 通信路の暗号化 | 公衆 Wi-Fi 上の盗聴 / MITM を防止 |
+| 内部リソースへのアクセス | 外出先から KDC / NFS / SMB / Web SSO に LAN 同等で接続 |
+| DNS 統一 | 自宅 DNS (Samba AD 内蔵) を全クライアントで使用 → 内部名 (`kdc01.home.lab`) が解決可能 |
+| 送信元 IP 固定 | 外向き通信が自宅 IP になるため、地理制約サービス / 自宅前提のフィルタにも適合 |
+| Kerberos 前提条件の確保 | KDC との通信が必須なので、外出先からも TGT 取得が可能になる |
+
+#### 鍵管理
+- WireGuard の鍵は AD の `pwdLastSet` 連動などはできないため、**LDAP 属性 `wireguardPublicKey` を独自スキーマで追加** し、admin スクリプトでピア構成を生成・配布する運用が現実解。
 - 「Kerberos でログオン → そのチケットで WireGuard 構成 (ピア鍵) を pull → wg-quick up」というラッパースクリプトを `clients/linux/wg-pull.sh` として提供することは可能。
+- Windows クライアントは公式 WireGuard クライアントを使い、ピア構成は管理者が `*.conf` を配布 (or QR コード / wg-easy)。
+
+#### 設計パラメータ (TBD)
+| 項目 | 暫定 | 備考 |
+|------|------|------|
+| WG エンドポイント | TBD | 自宅ルータ or TS-233。ルータが対応していれば終端負荷を分離 |
+| Public IP / DDNS | TBD | 固定 IP がなければ DDNS (no-ip, duckdns, Cloudflare DDNS) |
+| UDP ポート | 51820 | 必要なら別ポートに |
+| トンネル方針 | Full tunnel (`0.0.0.0/0`) | Split tunnel (自宅 LAN のみ) も選択可 |
+| ピア数想定 | TBD | 利用するデバイス数 |
+
+> ⚠ TBD-13: WG エンドポイントを自宅ルータか TS-233 か。
+> ⚠ TBD-14: 動的 IP 環境なら DDNS の選定。
 
 ### 13.6 統合スコープの推奨優先度 (Phase 2.x 内に取り込むもの)
 1. **K-01 SSH GSSAPI** (即時、コスト極小、利便性最大)
@@ -377,10 +410,166 @@ Phase 3 候補: K-04 (Web SSO), K-20 (各 Web アプリ統合), V-01 (VPN Kerber
 
 ---
 
-## 14. レビュー履歴
+## 14. Phase 3: PXE / ネットブートによる OS 復元基盤
+
+### 14.1 目的
+- マシン故障 / OS 破損 / 新規プロビジョニング時に、**ネットワーク経由で OS をブートし、自動で再構築** できるようにする。
+- 「壊れたら 5〜10 分で復活」を実現し、状態の所在を **「マシン」ではなく「KDC + PXE サーバ」** に寄せる。
+- Kerberos / SSSD の自動 join まで含めて自動化し、再構築直後から既存ユーザでログイン可能にする。
+
+### 14.2 スコープ
+| ID | 項目 | 内容 |
+|----|------|------|
+| P-01 | DHCP | next-server / PXE オプション (option 66/67) を配布 |
+| P-02 | TFTP | iPXE バイナリ (`undionly.kpxe`, `ipxe.efi`, `snponly.efi`) を配信 |
+| P-03 | HTTP | カーネル / initramfs / squashfs / Ignition / unattend.xml を高速配信 |
+| P-04 | iPXE メニュー | Windows / Fedora CoreOS / メモリ診断 / ローカルディスクブート を選択 |
+| P-05 | **Fedora CoreOS PXE** | Live PXE で起動 → Ignition で初期化 → Kerberos join 済み状態で完成 |
+| P-06 | **Windows PXE** | WDS or iPXE + wimboot で WIM 配信、unattend.xml でドメイン参加自動化 |
+| P-07 | UEFI / Secure Boot 対応 | shim 経由 or 自前署名 |
+| P-08 | 認証 / 制限 | LAN セグメント限定。VLAN 分離推奨 |
+
+### 14.3 採用方式
+| 観点 | A. **netboot.xyz + 独自カスタム** | B. **MAAS (Canonical)** | C. **Foreman / Cobbler** |
+|------|----------------------------------|------------------------|--------------------------|
+| 軽量さ | ◎ コンテナ 1 つ | △ x86_64 中心、TS-233 不可 | △ 重い |
+| Windows 配信 | ○ iPXE + wimboot | △ Linux 中心 | ○ |
+| Fedora CoreOS | ◎ Live PXE 標準 | ○ | ○ |
+| ARM64 (TS-233) | ◎ | × | △ |
+| 学習コスト | 低 | 中 | 高 |
+| 推奨 | **◎** | × | △ |
+
+### 14.4 暫定推奨: **A. iPXE + netboot.xyz ベース + 独自メニュー**
+- TS-233 上のコンテナ (`dnsmasq` + `nginx` + `tftpd-hpa`) で軽量に構築可能。
+- Fedora CoreOS は公式の **Live PXE images** を `nginx` で配信し、Ignition は KDC のホスト名や CA 証明書を埋め込んだものを動的生成。
+- Windows は **iPXE → wimboot → boot.wim** 経由でセットアップ起動。`autounattend.xml` でドメイン参加と Hello 登録を自動化。
+
+### 14.5 アーキテクチャ
+```
+                 [新規 / 故障マシン]
+                       │ PXE Boot (Network Boot 起動)
+                       ▼
+   ┌─────────────────────────────────────────────┐
+   │  TS-233 (Container Station)                  │
+   │  ┌────────────┐  ┌────────────┐ ┌──────────┐│
+   │  │ dnsmasq    │  │ tftpd      │ │ nginx    ││
+   │  │ (DHCP proxy│  │ (iPXE 配信)│ │ (HTTP    ││
+   │  │  or 主 DHCP│  └────────────┘ │  カーネル││
+   │  └────────────┘                 │  WIM 等)││
+   │                                  └──────────┘│
+   │  ┌─────────────────────────────────────────┐│
+   │  │ Ignition / Unattend テンプレート生成    ││
+   │  │  (KDC ホスト名, CA 証明書を埋め込み)    ││
+   │  └─────────────────────────────────────────┘│
+   └─────────────────────────────────────────────┘
+                       │
+                       ▼
+            [Kerberos KDC = 同 TS-233 上]
+            (初回ブート時に realm join / smartcard 登録)
+```
+
+### 14.6 機能要件
+| ID | 要件 | 受け入れ基準 |
+|----|------|--------------|
+| FR-P-01 | 新規 PC を PXE ブートしメニューが出る | iPXE メニューが 30 秒以内に表示 |
+| FR-P-02 | Fedora CoreOS が無人インストール完了 | 起動後 SSH で `alice@` でログイン可能 (Kerberos 認証) |
+| FR-P-03 | Windows が無人インストール完了 | 起動後ドメインユーザでサインイン可能 |
+| FR-P-04 | 復元後の Kerberos join が自動 | Ignition / unattend に組み込まれ手動操作ゼロ |
+| FR-P-05 | UEFI Secure Boot マシンで起動可 | shim 経由で起動成功 |
+| FR-P-06 | 既存 DHCP との競合回避 | dnsmasq の `dhcp-range` を proxyDHCP モードで併用可 |
+
+### 14.7 リスク
+| # | リスク | 対策 |
+|---|--------|------|
+| R-P-1 | 家庭ルータの DHCP と衝突 | proxyDHCP モード (option 66 のみ追加配布) で共存 |
+| R-P-2 | TS-233 1 台障害で復元基盤も失う | iPXE バイナリと CoreOS イメージは外付け USB にもミラー |
+| R-P-3 | Secure Boot 鍵管理 | 自前 MOK enroll 手順を Runbook 化 |
+| R-P-4 | Ignition に CA 秘密鍵等の機微情報を含めない | 公開鍵 / 信頼 CA 証明書のみ。秘密鍵は初回ブート後に取得 |
+
+---
+
+## 15. Phase 4: 自動更新ポリシー (リリース追従)
+
+### 15.1 目的
+- 各 OS が **常に最新のリリースに自動追従** し、人手によるメンテナンスを最小化する。
+- セキュリティパッチの遅延をゼロに近づける。
+- ロールバック可能性を確保し、自動更新による障害リスクを軽減。
+
+### 15.2 OS 別方針
+| OS | 更新メカニズム | 自動化方式 | ロールバック |
+|----|---------------|-----------|------------|
+| **Fedora CoreOS** | rpm-ostree + **zincati** (標準搭載) | リリースストリーム購読、再起動戦略を `update strategy` で制御 | ostree で前世代に rollback (`rpm-ostree rollback`) |
+| **Fedora Silverblue** | rpm-ostree + systemd timer | `rpm-ostree upgrade` を週次実行 | 同上 |
+| **QNAP (TS-233)** | QTS Auto Update | QTS GUI 設定で自動有効化 | スナップショット (RAID 構成依存) |
+| **Windows** | Windows Update for Business | グループポリシー / Intune で「自動ダウンロード + アクティブ時間外再起動」 | 「以前のビルドに戻す」(10 日以内) |
+| **コンテナ (Samba / step-ca 等)** | Watchtower / Renovate | タグ pin + Renovate で PR 自動作成、merge で適用 | Compose の image タグを前版に戻す |
+
+### 15.3 Fedora CoreOS 自動更新 (詳細)
+- **zincati** が標準搭載のため、`Type=automatic` で稼働させるだけで以下が動く:
+  - リリースストリーム (`stable` / `testing` / `next`) を購読
+  - 新リリース検出 → ローカルダウンロード → 再起動戦略に従い再起動
+- **再起動戦略 (`/etc/zincati/config.d/`)**:
+  - `immediate`: 即時再起動 (検証マシン向け)
+  - `periodic`: 指定曜日 / 時間帯のみ再起動 (本番向け、推奨)
+  - `fleet_lock`: 複数台で互いに排他制御 (HA 構成時)
+- **想定設定** (homelab 用):
+  ```toml
+  [updates]
+  strategy = "periodic"
+  [[updates.periodic.window]]
+  days = [ "Sun" ]
+  start_time = "03:00"
+  length_minutes = 60
+  ```
+- **失敗時の rollback**:
+  - 起動失敗を検知すると ostree が自動で前世代を選択
+  - 手動: `rpm-ostree rollback && systemctl reboot`
+
+### 15.4 機能要件
+| ID | 要件 | 受け入れ基準 |
+|----|------|--------------|
+| FR-U-01 | Fedora CoreOS が自動でメジャー / マイナー追従 | 設定後、リリース公開から ≤ 7 日以内に適用される |
+| FR-U-02 | 更新は週次の指定時間帯のみ再起動 | 平日昼間に再起動しない |
+| FR-U-03 | 起動失敗時に自動 rollback | カーネルパニック等で前世代が選択される |
+| FR-U-04 | Windows は業務時間外に再起動 | アクティブ時間 9:00-22:00 を尊重 |
+| FR-U-05 | コンテナイメージは tag pin + 通知ベース更新 | 自動適用ではなく PR ベースで承認制 (誤更新防止) |
+| FR-U-06 | KDC は自動更新前に DB バックアップ | systemd 経由で zincati pre-reboot hook 実行 |
+
+### 15.5 非機能要件
+| ID | 内容 |
+|----|------|
+| NFR-U-01 | 更新失敗の通知: メール / Webhook / Grafana アラート |
+| NFR-U-02 | KDC は更新ウィンドウをクライアントとずらす (循環停止回避) |
+| NFR-U-03 | 更新ログを 90 日保存 |
+
+### 15.6 リスク
+| # | リスク | 対策 |
+|---|--------|------|
+| R-U-1 | 自動更新で互換性破壊 (Samba メジャー版アップ等) | コンテナは tag pin、OS は `stable` ストリームのみ追従 |
+| R-U-2 | 全ノードが同時再起動 → 認証断 | KDC とクライアントで更新ウィンドウをずらす |
+| R-U-3 | rollback できない更新 (ファームウェア等) | ファームは手動承認制とする |
+
+---
+
+## 16. 改訂されたフェーズ計画
+
+| Phase | テーマ | 主要成果 | 状態 |
+|-------|-------|---------|------|
+| 1 | Windows 基盤 (WSL2 + Docker + buildx) | `setup-homelab.ps1` 完走 | ✅ 完了 |
+| 2 | Kerberos ID 統合 + MFA (パスワード / 指紋 / YubiKey) | KDC 構築 + Win/Linux クライアント join + PKINIT + バックアップ | 🚧 要件定義中 |
+| **2.x** | **WireGuard Road Warrior トンネル** | 外出先 → 自宅 WG → LAN + KDC 透過アクセス | 新規追加 |
+| 3 | **PXE / ネットブート OS 復元基盤** | iPXE + Fedora CoreOS Live + Windows WIM 配信 + Ignition/unattend 自動 join | 新規追加 |
+| 4 | **自動更新ポリシー (zincati / WUfB)** | Fedora CoreOS は週次自動再起動、Windows は WUfB、コンテナは Renovate PR ベース | 新規追加 |
+| 5 | 監視 / Web SSO / バックアップ高度化 | Prometheus + Grafana + Loki、SPNEGO で各 Web アプリ統合 | 未着手 |
+| 6 | HA / セカンダリ KDC / オフサイトバックアップ | 別ホスト or クラウドでレプリカ | 未着手 |
+
+---
+
+## 17. レビュー履歴
 
 | 日付 | 版 | 変更点 | レビュア |
 |------|----|--------|---------|
 | 2026-05-29 | v0.1 | 初版ドラフト | — |
 | 2026-05-29 | v0.2 | 認証方式 (パスワード/指紋/YubiKey) と MFA 要件を追加。CA / PKINIT を盛り込み | — |
 | 2026-05-29 | v0.3 | §13 Kerberos 統合候補 (SSH/NFS/SMB/Web SSO/sudo/WireGuard 等) を追加 | — |
+| 2026-05-29 | v0.4 | WireGuard Road Warrior 構成を明文化、§14 PXE 基盤 / §15 自動更新ポリシー (zincati 中心) を Phase 3/4 として追加 | — |
