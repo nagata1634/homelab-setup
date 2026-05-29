@@ -300,8 +300,87 @@ User ──(YubiKey 挿入 + PIN)──> Client (PKCS#11)
 
 ---
 
-## 13. レビュー履歴
+## 13. Kerberos 統合候補 (拡張機能)
+
+KDC を立てた後、**「同じ ID で透過的に使える」** ようになる機能を一覧化。
+Phase 2.x or Phase 3 で順次取り込み。
+
+### 13.1 ◎ 標準的に Kerberize できる (推奨)
+| # | 機能 | Kerberos 統合方式 | 嬉しさ |
+|---|------|------------------|--------|
+| K-01 | **SSH (GSSAPI)** | `GSSAPIAuthentication yes` + 各サーバの host keytab | `kinit` 1 回で全 Linux に **パスワードレス SSH**。鍵配布不要 |
+| K-02 | **NFSv4 (krb5p)** | `sec=krb5p` で完全暗号化 | LAN 内ファイル共有を **盗聴・改ざん耐性付きで提供**。NFS の弱点解消 |
+| K-03 | **SMB/CIFS** | Samba AD が標準サポート | Windows / macOS / Linux 全てから同一資格でファイル共有 |
+| K-04 | **HTTP / Web SSO (SPNEGO)** | Apache `mod_auth_gssapi` / nginx `spnego-http-auth` | Grafana, Gitea, Jenkins 等で **ブラウザがチケットを送り自動ログイン** (Edge/Chrome/Firefox 標準対応) |
+| K-05 | **PostgreSQL / MariaDB** | `gss` 認証メソッド | DB クライアントから **パスワードレス接続**。pgAdmin 等も対応 |
+| K-06 | **LDAP** | Samba AD 内蔵、GSSAPI で bind | アプリ側 (Nextcloud, GitLab) の認証バックエンドにも流用 |
+| K-07 | **sudo (HBAC ライク)** | SSSD + AD グループで `sudoers` を集中管理 | 全 Linux ホストの sudo ルールを 1 箇所で管理 |
+| K-08 | **WinRM / PowerShell Remoting** | Kerberos auth が既定 | Windows ホスト間の **パスワードレス管理**、Ansible WinRM も |
+| K-09 | **RDP (NLA)** | ドメイン参加で自動 Kerberos | Windows リモートデスクトップが SSO 化 |
+| K-10 | **CIFS / SMB マウント (Linux)** | `mount.cifs sec=krb5` | Linux 側で Samba 共有を自動マウント、認証透過 |
+| K-11 | **DNS 動的更新 (GSS-TSIG)** | Samba AD 内蔵 DNS | 各クライアントが起動時に自分の A レコードを安全に登録 |
+
+### 13.2 ○ 半 Kerberize / SSO 化できる
+| # | 機能 | 統合方式 | 備考 |
+|---|------|---------|------|
+| K-20 | **Gitea / GitLab / Jenkins / Grafana / Nextcloud / Vaultwarden** | LDAP バックエンド + SPNEGO ブラウザ SSO | Web UI は SPNEGO、CLI は LDAP パスワード or トークン |
+| K-21 | **Jupyter / VS Code Server** | SSH GSSAPI 越し or リバプロで SPNEGO | リモート開発が透過的 |
+| K-22 | **CUPS (印刷)** | Kerberos 認証可 | 家庭用ではオーバーキル |
+| K-23 | **IMAP / SMTP** | GSSAPI SASL | 家庭メール立てるなら |
+| K-24 | **Kubernetes (kubectl)** | OIDC 経由が現実的 (KDC + Keycloak) | k3s 入れた時に検討 |
+| K-25 | **Container Registry (Harbor 等)** | LDAP バックエンド | dev/CI 基盤と相性良 |
+
+### 13.3 △ 直接の Kerberos 統合は **不可** (ご質問の WireGuard 含む)
+
+| # | 機能 | なぜ統合できないか | 代替・回避策 |
+|---|------|------------------|-------------|
+| K-30 | **WireGuard** | プロトコル設計上、認証は **Curve25519 の静的公開鍵ペアのみ**。ユーザ概念・パスワード・チケットを扱わない | (a) **公開鍵を AD/LDAP 属性に格納** し、ピア構成を生成するスクリプトを Kerberos 認証付きで配布。(b) **wg-easy / wg-portal** に SPNEGO リバプロを被せ、ブラウザ SSO でピア発行 |
+| K-31 | **Tailscale** | 独自 ID プロバイダ。OIDC は使えるが Kerberos 不可 | OIDC で Keycloak → Kerberos バックエンド (Phase 3) |
+| K-32 | **DNSSEC / 一般 NTP** | プロトコル外 | Kerberos の前提として NTP は別途必須 (chrony) |
+
+### 13.4 ◎ Kerberos と相性の良い代替 VPN (もし「VPN を Kerberize したい」なら)
+| # | 製品 | 認証方式 |
+|---|------|---------|
+| V-01 | **strongSwan (IKEv2) + EAP-GSSAPI** | Kerberos チケットで VPN 接続。Windows 標準クライアント可 |
+| V-02 | **OpenVPN + openvpn-auth-pam (krb5)** | パスワード認証経路を Kerberos に投げる |
+| V-03 | **OpenSSH ベース VPN (sshuttle, ssh -w)** | GSSAPI SSH そのもの。シンプル |
+
+### 13.5 WireGuard と Kerberos の現実的な組み合わせ案
+
+WireGuard を **「LAN を超えた経路の暗号化」** に使い、その上の各サービスを Kerberize する **二層構成** が実用的。
+
+```
+外出先クライアント
+   │
+   │  ① WireGuard (静的鍵、家庭ルータで終端) ─── 通信路の暗号化
+   ▼
+家庭 LAN
+   │
+   ▼
+   ② SSH/NFS/SMB/HTTP (Kerberos)  ─── ユーザ認証 + 透過 SSO
+```
+
+- WireGuard の鍵管理: AD の `pwdLastSet` 連動などはできないため、**LDAP 属性 `wireguardPublicKey` を独自スキーマで追加** し、admin スクリプトでピア構成を生成・配布する運用が現実解。
+- 「Kerberos でログオン → そのチケットで WireGuard 構成 (ピア鍵) を pull → wg-quick up」というラッパースクリプトを `clients/linux/wg-pull.sh` として提供することは可能。
+
+### 13.6 統合スコープの推奨優先度 (Phase 2.x 内に取り込むもの)
+1. **K-01 SSH GSSAPI** (即時、コスト極小、利便性最大)
+2. **K-03 SMB/CIFS** (Samba AD なので自動で得られる)
+3. **K-11 DNS 動的更新** (同上、自動)
+4. **K-07 sudo 集中管理** (SSSD 設定追加だけ)
+5. **K-02 NFSv4 krb5p** (ファイル共有を NFS で立てるなら)
+
+Phase 3 候補: K-04 (Web SSO), K-20 (各 Web アプリ統合), V-01 (VPN Kerberize)
+
+> ⚠ TBD-11: 上記 13.6 のうちどこまでを Phase 2 のスコープに含めるか。
+> ⚠ TBD-12: WireGuard を導入するか / どの代替 VPN を採用するか。
+
+---
+
+## 14. レビュー履歴
 
 | 日付 | 版 | 変更点 | レビュア |
 |------|----|--------|---------|
 | 2026-05-29 | v0.1 | 初版ドラフト | — |
+| 2026-05-29 | v0.2 | 認証方式 (パスワード/指紋/YubiKey) と MFA 要件を追加。CA / PKINIT を盛り込み | — |
+| 2026-05-29 | v0.3 | §13 Kerberos 統合候補 (SSH/NFS/SMB/Web SSO/sudo/WireGuard 等) を追加 | — |
