@@ -1,0 +1,29 @@
+# 各モジュールのバージョン pin。
+# Renovate がこのファイルを監視して PR を作成する想定。
+# 将来 modules/<name>/ を独立 repo に切り出した際は、ここのタグで参照する。
+
+kerberos:
+  # Samba AD DC コンテナイメージ
+  samba_ad_dc: "4.20.4"   # TBD: ARM64 動作確認後に確定
+  # step-ca (PKINIT 用 CA)
+  step_ca: "0.27.4"
+  # SSSD クライアント (Fedora パッケージはストリーム連動)
+  sssd_min_version: "2.9.0"
+
+wireguard:
+  # WireGuard コンテナ (TS-233 上で動かす場合)
+  wg_easy: "15.0.0"       # TBD: 採用するか未確定
+
+pxe:
+  # iPXE バイナリは netboot.xyz のものを使用
+  netboot_xyz: "2.0.78"
+  # 配信する Fedora CoreOS のストリーム
+  fcos_stream: "stable"
+  # Windows 配信用 wimboot
+  wimboot: "2.7.6"
+
+autoupdate:
+  # zincati 設定テンプレートのバージョン (本 repo 内)
+  zincati_config_template: "v0"
+  # Renovate 設定
+  renovate_config: "config:recommended"
