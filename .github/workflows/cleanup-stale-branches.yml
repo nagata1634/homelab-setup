@@ -1,0 +1,54 @@
+name: One-time cleanup of stale branches
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (list only, no delete)'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const dryRun = context.payload.inputs.dry_run === 'true';
+            const PROTECTED = ['main', 'master', 'develop'];
+            const branches = await github.paginate(
+              github.rest.repos.listBranches,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 },
+            );
+            const stale = branches
+              .map(b => b.name)
+              .filter(n => !PROTECTED.includes(n) && !n.startsWith('dependabot/'));
+            const { data: mainRef } = await github.rest.git.getRef({
+              owner: context.repo.owner, repo: context.repo.repo, ref: 'heads/main',
+            });
+            const mainSha = mainRef.object.sha;
+            for (const branch of stale) {
+              try {
+                const cmp = await github.rest.repos.compareCommits({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  base: mainSha, head: `heads/${branch}`,
+                });
+                if (cmp.data.ahead_by === 0) {
+                  if (dryRun) { console.log(`[dry-run] Would delete merged: ${branch}`); continue; }
+                  await github.rest.git.deleteRef({
+                    owner: context.repo.owner, repo: context.repo.repo, ref: `heads/${branch}`,
+                  });
+                  console.log(`Deleted merged: ${branch}`);
+                } else {
+                  console.log(`Skipping unmerged: ${branch} (ahead_by=${cmp.data.ahead_by})`);
+                }
+              } catch (e) {
+                console.warn(`${branch}: ${e.message}`);
+              }
+            }
