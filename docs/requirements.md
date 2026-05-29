@@ -1,0 +1,307 @@
+# Homelab 要件定義書 (Phase 2: Kerberos による ID 統合)
+
+最終更新: 2026-05-29
+ステータス: ドラフト v0.1 (議論用たたき台)
+
+---
+
+## 1. 背景と目的
+
+### 1.1 背景
+- Phase 1 で Windows ホストに WSL2 + Docker Desktop + buildx (multi-arch) を導入済み (`setup-homelab.ps1`)。
+- ホームラボには複数の OS / マシンが混在する見込み:
+  - Windows (デスクトップ / WSL2)
+  - QNAP TS-233 (ARM64, Linux)
+  - Fedora Atomic (将来のサーバ / コンテナホスト)
+- それぞれにローカルユーザを個別作成 → パスワードや UID/GID 管理が分散しており、運用負荷とセキュリティリスクが高い。
+
+### 1.2 目的
+- **シングルサインオン基盤 (Kerberos KDC) を中心に、Windows / Linux のユーザ認証を一元化する**。
+- 各マシンへのログオン、ファイル共有、SSH などで **同一のユーザ名 / パスワード** を利用可能にする。
+- 将来的に Web サービス (Nextcloud, Grafana 等) も同じ ID に統合できる素地を作る。
+
+### 1.3 認証方式の要件
+本ホームラボでサポートする認証手段は以下の **3 種類**。利用者は環境に応じて使い分けでき、可能な範囲で組み合わせ (MFA) も可能とする。
+
+| # | 方式 | 主な利用シーン | Kerberos との結合方式 |
+|---|------|---------------|-----------------------|
+| 1 | **パスワード** | リモート SSH、サーバ初期セットアップ、フォールバック | 標準 Kerberos preauth (ENC-TIMESTAMP) |
+| 2 | **指紋** | デスクトップ / ノート PC のロック解除 | ローカル PAM (Windows Hello / fprintd) が TPM 上のキャッシュ済み TGT or 保護されたパスワードをアンロック → PAM 経由で `kinit` |
+| 3 | **YubiKey** | 高セキュリティ用途、リモートからの強い認証 | PIV アプレットの X.509 証明書を用いた **PKINIT** (Kerberos 標準)。WebAuthn 用途は Web サービス向けに別途 |
+
+> ⚠ 重要な前提: 指紋は **本人ローカルでのアンロック手段** であり、ネットワーク越しに指紋データを送信するわけではない。Kerberos プロトコル自体は指紋を理解しないため、「指紋でローカル PAM → PAM が裏で kinit」という構図になる。
+
+### 1.4 非目的 (今フェーズではやらないこと)
+- インターネットへの一般公開 SSO (Keycloak 等の OIDC 連携)。
+- マルチサイト / 高可用 (HA) 構成。
+- メールサーバ等の追加アプリケーション統合 (将来検討)。
+- 指紋データの集中管理 / ネットワーク経由での指紋認証 (技術的にも非推奨)。
+
+---
+
+## 2. スコープ
+
+### 2.1 In Scope
+| # | 項目 | 内容 |
+|---|------|------|
+| S1 | KDC 構築 | Kerberos の Key Distribution Center を 1 台構築 |
+| S2 | LDAP | UID/GID, homeDir, ログインシェル等の POSIX 属性管理 |
+| S3 | DNS | Kerberos が要求する正引き / 逆引き / SRV レコード整備 |
+| S4 | 時刻同期 | NTP / chrony による全ノード時刻同期 (スキュー ≤ 5 分) |
+| S5 | Linux クライアント統合 | SSSD で Linux (Fedora Atomic / Ubuntu on WSL / QNAP) を join |
+| S6 | Windows クライアント統合 | Windows をドメイン参加 (または kinit ベースの限定統合) |
+| S7 | バックアップ | KDC データベース / LDAP / krb5.keytab の定期バックアップ |
+| S8 | ドキュメント | 構築手順 / 運用 Runbook / 障害復旧手順 |
+| S9 | **PKI 基盤** | YubiKey PIV 証明書を発行する CA (KDC 証明書 + クライアント証明書) |
+| S10 | **PKINIT 設定** | KDC 側で証明書認証 (PKINIT) を有効化、YubiKey からのチケット取得を許可 |
+| S11 | **指紋連携** | Windows Hello / Linux fprintd で PAM 経由 kinit を実現 (各クライアントローカル設定) |
+| S12 | **MFA ポリシー** | 管理者アカウント等、特定ユーザに YubiKey 必須を強制可能にする |
+
+### 2.2 Out of Scope
+- マルチ KDC / レプリカ (将来 Phase 3 で検討)。
+- Windows AD との双方向トラスト。
+- スマートカード / FIDO2 等のハードウェア多要素 (将来検討)。
+
+---
+
+## 3. 採用方式の選択肢 (TBD)
+
+3 つの代表的アプローチを **MFA / YubiKey 観点も含めて** 比較。本ドキュメント承認時に **A / B / C を 1 つ確定** する。
+
+| 観点 | A. **Samba AD DC** | B. **FreeIPA** | C. **MIT Kerberos + OpenLDAP** |
+|------|-------------------|---------------|--------------------------------|
+| 提供物 | Kerberos + LDAP + DNS + AD 互換 | Kerberos + 389-DS + DNS + 内蔵 CA + sudo/HBAC + OTP | Kerberos のみ (LDAP / CA は別途) |
+| Windows 統合 | ◎ ネイティブにドメイン参加可能 | △ AD トラスト経由 | △ kinit + ksetup の手動運用 |
+| Linux 統合 | ○ SSSD で参加可能 | ◎ SSSD ネイティブ統合 | ○ SSSD 設定が必要 |
+| **PKINIT (YubiKey)** | ○ Samba AD は PKINIT 対応 / CA は自前で準備 | ◎ **内蔵 Dogtag CA で証明書発行 → PKINIT 標準サポート** | ○ MIT Kerberos は PKINIT 対応 / CA は自前 |
+| **指紋 (PAM 連携)** | ○ Windows Hello / fprintd はクライアント側設定で対応 | ○ 同左 | ○ 同左 |
+| **OTP (HOTP/TOTP)** | △ Azure MFA 等の外部連携が必要 | ◎ **内蔵 OTP トークン管理** | △ pam_oath 等で別途構築 |
+| ARM64 (TS-233) 対応 | ○ パッケージあり | △ x86_64 中心、ARM64 は要検証 | ◎ 軽量 |
+| RAM 消費 | 中 (~500MB) | 大 (~1.5GB, TS-233 では厳しい) | 小 (~100MB) |
+| 学習コスト | 中 | 高 | 高 (構成要素を自分で組む) |
+| 推奨度 | **◎ (Windows 中心、CA は別建てでも可)** | ○ (MFA 機能は最強だが TS-233 不可、別ホスト要) | ○ (学習目的) |
+
+### 暫定推奨: **A. Samba AD DC + 別建ての軽量 CA (step-ca or smallstep)**
+- Windows をシームレスにドメイン参加できる点が決定的。
+- TS-233 の 2GB RAM でも Samba AD DC 単体なら現実的。
+- YubiKey の PKINIT 用には **step-ca** (Go 製、ARM64 対応、~50MB) を別コンテナで併設し、ACME / SCEP で証明書を YubiKey PIV に書き込む運用とする。
+- 指紋は各クライアントローカルの PAM 設定 (Windows Hello / fprintd) で対応、KDC 側は関与しない。
+
+### 代替案: **B. FreeIPA を別ホスト (x86_64 ミニ PC) で稼働**
+- TS-233 の RAM 制約上、FreeIPA を稼働させるには別途 4GB 以上の Linux ホストが必要。
+- 採用するなら Phase 2 と同時に「FreeIPA 用ホスト調達」がスコープに入る。
+
+> ⚠ TBD-1: 採用方式 (A / B / C) の最終確定。MFA 要件が強い場合 B も再評価対象。
+
+---
+
+## 4. 想定アーキテクチャ (Samba AD DC 採用案)
+
+```
+                    ┌─────────────────────────────┐
+                    │  Cloudflare / Internet      │  (今フェーズではアクセスしない)
+                    └─────────────────────────────┘
+                                  │
+   ┌──────────────────────────────┴─────────────────────────────┐
+   │                       家庭 LAN (192.168.x.0/24)              │
+   │                                                              │
+   │  ┌────────────────────┐     ┌────────────────────┐          │
+   │  │ Windows Host       │     │ QNAP TS-233 (ARM64)│          │
+   │  │ - WSL2 / Docker    │     │ - Samba AD DC      │  ← KDC   │
+   │  │ - ドメイン参加     │◀───▶│ - DNS (AD 統合)    │          │
+   │  └────────────────────┘     │ - LDAP             │          │
+   │                              │ - chrony (NTP)     │          │
+   │  ┌────────────────────┐     └────────────────────┘          │
+   │  │ Fedora Atomic Host │              ▲                       │
+   │  │ - SSSD で AD join  │──────────────┘                       │
+   │  │ - Container 基盤   │                                      │
+   │  └────────────────────┘                                      │
+   └──────────────────────────────────────────────────────────────┘
+```
+
+### 主要ノード
+| ホスト | 役割 | OS | 認証クライアント |
+|--------|------|----|-----------------|
+| TS-233 | KDC / DNS / LDAP (プライマリ) | QNAP (Container Station 上の Debian/Ubuntu ARM64) | — |
+| Windows Host | デスクトップ | Windows 10/11 | ネイティブ AD 参加 |
+| Fedora Atomic Host | コンテナサーバ | Fedora CoreOS / Silverblue | SSSD + realm join |
+| WSL2 (Ubuntu-24.04) | 開発環境 | Linux | SSSD (オプション) |
+
+---
+
+## 5. 機能要件
+
+| ID | 要件 | 受け入れ基準 |
+|----|------|--------------|
+| FR-01 | 単一ユーザ ID で Windows にログオン可能 | ドメインユーザ `alice@HOME.LAB` で Windows サインイン成功 |
+| FR-02 | 単一ユーザ ID で Linux に SSH 可能 | `ssh alice@fedora.home.lab` がパスワードで成功し、`id` で AD の UID/GID が見える |
+| FR-03 | パスワード変更が全ノードに即時反映 | `kpasswd` または Windows の Ctrl+Alt+Del からの変更が他ノードに反映 |
+| FR-04 | パスワードポリシー設定可能 | 最小長 / 履歴 / 有効期限を AD ポリシーで強制 |
+| FR-05 | ユーザ追加が CLI / GUI から可能 | `samba-tool user add` および RSAT からの追加に成功 |
+| FR-06 | サービスチケットによるパスワードレス SSH (GSSAPI) | `kinit` 後の `ssh -K` が成功 |
+| FR-07 | ホームディレクトリの自動マウント (任意) | autofs または mkhomedir で初回ログイン時に作成 |
+| FR-08 | **YubiKey でログオン (Windows)** | YubiKey 挿入 + PIN で Windows サインイン成功 (PIV スマートカードログオン) |
+| FR-09 | **YubiKey で kinit (Linux)** | `kinit -X X509_user_identity=PKCS11:...` で TGT 取得成功 |
+| FR-10 | **指紋で Windows サインイン** | Windows Hello 登録後、指紋でアンロック → 裏で TGT が取得される |
+| FR-11 | **指紋で Linux ログオン** | fprintd 登録後、指紋でログオン → PAM 経由 kinit が走り TGT 取得 |
+| FR-12 | **管理者は YubiKey 必須** | `admin@HOME.LAB` はパスワードのみでは TGT 取得不可。証明書認証必須 |
+| FR-13 | YubiKey 紛失時のリボーク手順 | CA で証明書失効 → CRL/OCSP 反映、対象 YubiKey が KDC から拒否される |
+
+---
+
+## 6. 非機能要件
+
+| ID | カテゴリ | 要件 |
+|----|---------|------|
+| NFR-01 | 可用性 | KDC 停止時は新規ログオン不可を許容 (HA は Phase 3)。既ログオンセッションは継続可能 |
+| NFR-02 | 性能 | 認証応答 ≤ 500ms (LAN 内) |
+| NFR-03 | 時刻精度 | 全ノード間スキュー ≤ 5 分 (Kerberos の要件) |
+| NFR-04 | バックアップ | 日次で DB / keytab / 設定をスナップショット、世代保存 7 日 |
+| NFR-05 | 復旧 | バックアップから 1 時間以内に KDC を再構築可能 (Runbook 整備) |
+| NFR-06 | セキュリティ | 暗号化方式は AES256-CTS-HMAC-SHA1-96 を最低限有効化、RC4 / DES は無効 |
+| NFR-07 | 監査 | ログオン成功 / 失敗を最低 30 日保存 |
+| NFR-08 | 運用 | 全設定を Git 管理 (本 repo)、再構築は IaC (Ansible / シェルスクリプト) から再現可能 |
+| NFR-09 | PKI | KDC 証明書 / クライアント証明書の有効期間: KDC=1 年、ユーザ=90 日 (短命) |
+| NFR-10 | YubiKey | PIV PIN は 8 桁以上、PUK は別管理。3 回失敗でロック |
+| NFR-11 | 指紋 | 指紋テンプレートはローカル TPM / Secure Enclave 内に閉じ、ネットワーク送信しない |
+| NFR-12 | リボーク | 紛失報告から ≤ 1 時間で対象証明書を失効可能 (CRL 配布間隔 = 30 分) |
+
+---
+
+## 7. 命名 / 設計パラメータ (TBD)
+
+| 項目 | 暫定値 | 備考 |
+|------|--------|------|
+| Kerberos Realm | `HOME.LAB` | 全大文字。実在 TLD を避ける |
+| DNS Domain | `home.lab` | 内部 DNS のみで解決 |
+| NetBIOS Name | `HOMELAB` | 15 文字以内 |
+| KDC ホスト名 | `kdc01.home.lab` | TS-233 を指す |
+| LAN サブネット | TBD | 例: `192.168.10.0/24` |
+| 管理者 UPN | `admin@HOME.LAB` | |
+| 初期ユーザ | TBD | 例: 家族メンバーごと |
+
+> ⚠ TBD-2: Realm 名 / DNS ドメインの確定 (`.lab` か `.internal` か等)。
+> ⚠ TBD-3: 既存 LAN サブネットの確認。
+> ⚠ TBD-4: 初期ユーザ一覧。
+
+---
+
+## 7.5 認証フロー (シーケンス概要)
+
+### 7.5.1 パスワード認証 (フォールバック)
+```
+User ──(username/pw)──> Client PAM ──(AS-REQ + PA-ENC-TIMESTAMP)──> KDC
+                                  <──(TGT 暗号化されたもの)─────────
+```
+
+### 7.5.2 指紋認証 (Windows Hello / fprintd)
+```
+User ──(指紋)──> ローカル TPM/Secure Enclave
+                       │
+                       └──> 保護されたパスワード or キャッシュ鍵を解放
+                                  │
+                                  └──> PAM が裏で AS-REQ → TGT 取得
+```
+※ 指紋データは絶対にネットワークに出ない。あくまでローカルのアンロック。
+
+### 7.5.3 YubiKey 認証 (PKINIT)
+```
+User ──(YubiKey 挿入 + PIN)──> Client (PKCS#11)
+        │
+        └──> PIV スロット 9a の秘密鍵で署名
+                  │
+                  └──> AS-REQ (PA-PK-AS-REQ, クライアント証明書同梱) ──> KDC
+                                                                          │
+                          KDC が CA 信頼 + CRL 確認 ──> TGT を発行 ◀──┘
+```
+
+---
+
+## 8. 制約と前提
+
+- **TS-233 の RAM は 2GB** のため、AD DC は単体運用 (重い追加サービスは別ホスト)。
+- TS-233 上では QNAP Container Station 上の Debian/Ubuntu ARM64 コンテナとして Samba AD DC を稼働させる方針 (QTS 直接インストールは避ける)。
+- DNS は Samba AD DC 内蔵 (BIND9_DLZ ではなく内蔵 DNS を使用、運用簡素化)。
+- Fedora Atomic ホストは未調達 / 未構築の前提。実装は Windows + TS-233 から開始。
+- 家庭 LAN 内部のみで完結し、外部公開はしない。
+
+---
+
+## 9. リスクと対策
+
+| # | リスク | 対策 |
+|---|--------|------|
+| R1 | KDC 単一障害点 | 日次バックアップ + Runbook 整備。Phase 3 でセカンダリ DC を追加 |
+| R2 | 時刻ずれによる認証失敗 | 全ノード chrony 必須、KDC は上位 NTP に同期 |
+| R3 | DNS 設定ミスで Kerberos 解決不能 | 構築前に dig での SRV レコード確認手順をチェックリスト化 |
+| R4 | Windows のドメイン参加でローカルプロファイル消失 | 事前にローカルプロファイルのバックアップ / 移行手順を整備 |
+| R5 | QNAP Container Station のネットワーク制約 | host ネットワーク or macvlan で固定 IP 化、検証必須 |
+| R6 | ARM64 向け Samba AD DC パッケージの動作不確実性 | 初期構築前に PoC で smoke test (`samba-tool domain join` 等) |
+| R7 | YubiKey 紛失 → 締め出し | バックアップ YubiKey を 1 本必ず用意。リカバリ用パスワードは紙で金庫保管 |
+| R8 | CA 秘密鍵漏洩 | step-ca の root key は HSM or オフラインメディア保管、intermediate のみオンライン |
+| R9 | 指紋センサ故障 | パスワード or YubiKey でログオン可能なフォールバックを常に維持 |
+| R10 | PKINIT 設定ミスで全員ロックアウト | 管理者用パスワード認証のローカル経路を残す (`kadmin.local`) |
+| R11 | Windows のスマートカードログオン要件 (ドメインの CA 証明 NTAuth ストア登録) | 構築手順に AD への CA 証明書配布 (`certutil -dspublish`) を必須化 |
+
+---
+
+## 10. フェーズ計画
+
+| Phase | 内容 | 完了条件 | 状態 |
+|-------|------|----------|------|
+| 1 | Windows ホスト基盤 (WSL2 + Docker + buildx) | `setup-homelab.ps1` 完走 | ✅ 完了 |
+| **2** | **Kerberos ID 統合 (本ドキュメント)** | FR-01 〜 FR-06 達成 | 🚧 要件定義中 |
+| 2.1 | PoC: TS-233 上 Samba AD DC コンテナ起動 | `samba-tool domain provision` 成功 | 未着手 |
+| 2.2 | Windows ドメイン参加 | ドメインユーザでサインイン成功 | 未着手 |
+| 2.3 | Linux クライアント参加 (WSL2 → Fedora) | `realm join` 成功、SSH 通る | 未着手 |
+| 2.4 | **CA 構築 (step-ca) + PKINIT 有効化** | KDC 証明書発行 + Linux からの PKINIT 成功 | 未着手 |
+| 2.5 | **YubiKey プロビジョニング** | PIV スロット 9a に証明書書き込み、Win/Linux 双方でログオン成功 | 未着手 |
+| 2.6 | **指紋連携 (各クライアント)** | Windows Hello / fprintd でログオン → TGT 取得確認 | 未着手 |
+| 2.7 | バックアップ / Runbook 整備 | 復旧演習 1 回成功 + YubiKey 紛失リカバリ演習 | 未着手 |
+| 3 | HA 化 / 監視 / Web サービス統合 | 別途定義 | 未着手 |
+
+---
+
+## 11. 成果物 (Phase 2 完了時)
+
+- `docs/requirements.md` (本書、確定版)
+- `docs/architecture.md` (構成図 / シーケンス)
+- `docs/runbook-kdc.md` (運用 / 障害対応)
+- `kdc/` ディレクトリ
+  - `compose.yml` (Samba AD DC コンテナ定義)
+  - `provision.sh` (初期プロビジョニングスクリプト)
+  - `backup.sh` (日次バックアップ)
+- `clients/windows/join-domain.ps1`
+- `clients/windows/enable-smartcard-logon.ps1` (YubiKey PIV)
+- `clients/linux/realm-join.sh`
+- `clients/linux/setup-fprintd.sh` (指紋)
+- `clients/yubikey/provision.sh` (PIV プロビジョニング)
+- `ca/` ディレクトリ
+  - `compose.yml` (step-ca コンテナ)
+  - `provision-ca.sh`
+  - `issue-user-cert.sh`
+
+---
+
+## 12. オープン事項 (TBD まとめ)
+
+| # | 内容 | 期限 |
+|---|------|------|
+| TBD-1 | 採用方式 (Samba AD DC / FreeIPA / MIT 素) の最終決定 | Phase 2 着手前 |
+| TBD-2 | Realm 名 / DNS ドメイン名の確定 | Phase 2 着手前 |
+| TBD-3 | LAN サブネット / KDC の固定 IP | PoC 開始前 |
+| TBD-4 | 初期ユーザ一覧 | クライアント参加前 |
+| TBD-5 | バックアップ保管先 (TS-233 内 / 外付け USB / クラウド) | バックアップ実装前 |
+| TBD-6 | WSL2 を AD に参加させるか (利便性 vs 複雑性) | クライアント参加時 |
+| TBD-7 | YubiKey の型番 (5C NFC / 5 Bio / Security Key 等) | 調達前 |
+| TBD-8 | YubiKey の本数 (1 人あたりプライマリ + バックアップ = 2 本想定) | 調達前 |
+| TBD-9 | CA を AD DC と同居させるか別ホスト (TS-233 内 / Windows ホスト) | PoC 中 |
+| TBD-10 | パスワード認証を完全廃止するか (MFA 強制) / フォールバックとして残すか | Phase 2.4 まで |
+
+---
+
+## 13. レビュー履歴
+
+| 日付 | 版 | 変更点 | レビュア |
+|------|----|--------|---------|
+| 2026-05-29 | v0.1 | 初版ドラフト | — |
