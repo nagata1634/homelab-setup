@@ -129,8 +129,44 @@ length_minutes = 60
 - `monitoring/update-alert.yml` (Prometheus / Grafana)
 - `docs/runbook.md` (rollback 手順 / 緊急時の更新停止)
 
-## 11. レビュー履歴
+## 11. Open Design Decisions
+
+### ODD-U01: 再起動ウィンドウの時刻
+- **選択肢**: A. 深夜 (3:00 等) / B. 早朝 (6:00) / C. 任意の不在時間帯
+- **推奨**: A (家庭利用ピーク回避)
+- **ステータス**: 運用者と要相談
+
+### ODD-U02: コンテナの auto-merge ポリシー
+- **選択肢**: A. 全て手動 merge / B. patch のみ auto-merge / C. minor まで auto-merge
+- **推奨**: B (KDC コンテナの誤更新を防ぎつつ煩雑さ軽減)
+- **ステータス**: 議論中
+
+### ODD-U03: FCOS リリースストリーム
+- **選択肢**: A. stable / B. testing / C. next
+- **推奨**: A
+- **理由**: KDC を載せるため安定性最優先
+- **ステータス**: 確定
+
+### ODD-U04: 更新失敗の通知先
+- **選択肢**: A. メール / B. Webhook (Discord/Slack) / C. Grafana アラート
+- **推奨**: C + A (重要度別)
+- **ステータス**: 議論中
+
+---
+
+## 12. 参考資料
+
+- [zincati Documentation](https://coreos.github.io/zincati/)
+- [rpm-ostree](https://coreos.github.io/rpm-ostree/)
+- [Windows Update for Business](https://learn.microsoft.com/en-us/windows/deployment/update/waas-manage-updates-wufb)
+- [Renovate Documentation](https://docs.renovatebot.com/)
+- [Watchtower](https://containrrr.dev/watchtower/) (参考、本書では非採用)
+
+---
+
+## 13. レビュー履歴
 
 | 日付 | 版 | 変更点 |
 |------|----|--------|
 | 2026-05-29 | v0.1 | モジュール分離に伴う初版 |
+| 2026-05-29 | v0.2 | 公開品質向上 (Mermaid 図、Open Design Decisions、参考資料) |

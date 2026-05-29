@@ -59,20 +59,20 @@
 
 ## 5. 想定トポロジ
 
-```
-[外出先 PC] ── 公衆 Wi-Fi ── Internet
-     │
-     │  WG tunnel (UDP 51820)
-     │  AllowedIPs = 0.0.0.0/0
-     ▼
-┌──────────────────────────────┐
-│  WG 終端 (ルータ or TS-233)   │
-│  - peer 認証 (公開鍵ペア)    │
-│  - NAT / ルーティング        │
-└──────────────────────────────┘
-     │
-     ▼
-[自宅 LAN] → KDC / NFS / SMB / 内部 DNS
+```mermaid
+flowchart TB
+    Road["外出先 PC<br/>AllowedIPs = 0.0.0.0/0"]
+    Net["公衆 Wi-Fi / Internet"]
+    WG["WG 終端<br/>(ルータ or TS-233)<br/>peer 公開鍵認証 + NAT"]
+    KDC["Kerberos KDC"]
+    NFS["NFS / SMB"]
+    DNS["内部 DNS<br/>(Samba AD 内蔵)"]
+
+    Road --> Net
+    Net -- "UDP 51820 暗号化" --> WG
+    WG --> KDC
+    WG --> NFS
+    WG --> DNS
 ```
 
 ## 6. 機能要件
@@ -102,13 +102,13 @@
 
 | 項目 | 暫定値 | TBD |
 |------|-------|-----|
-| WG endpoint | TBD (ルータ or TS-233) | ✓ TBD-13 |
-| Public IP / DDNS | TBD | ✓ TBD-14 |
-| UDP ポート | 51820 | |
-| トンネル方針 | Full Tunnel (`0.0.0.0/0`) | |
-| WG サブネット | `10.10.0.0/24` (暫定) | |
-| ピア数想定 | TBD | |
-| クライアント DNS | `10.0.0.x` (自宅 DNS) | グローバル参照 |
+| WG endpoint | (運用者が決定) | ✓ |
+| Public IP / DDNS | (運用者が決定) | ✓ |
+| UDP ポート | `51820` (デフォルト) | |
+| トンネル方針 | Full Tunnel (`0.0.0.0/0`) | デフォルト、Split Tunnel プロファイル併設可 |
+| WG サブネット | (運用者が決定) | LAN と非衝突な RFC1918 帯 |
+| ピア数想定 | (運用者が決定) | |
+| クライアント DNS | 自宅 DNS (Samba AD 内蔵) | グローバル参照 |
 
 ## 9. 鍵管理ポリシー
 
@@ -144,8 +144,43 @@
 - `clients/linux/wg-pull.sh` (Kerberos 経由 pull)
 - ルータ終端時の手順 `docs/router-setup.md` (機種別)
 
-## 12. レビュー履歴
+## 12. Open Design Decisions
+
+### ODD-W01: WG 終端配置
+- **選択肢**: A. 家庭ルータ / B. TS-233 コンテナ
+- **推奨**: ルータが WG 対応なら A、そうでなければ B
+- **理由**: ルータ終端はハードウェアオフロード、TS-233 終端は管理 UI と鍵管理自動化が容易
+- **ステータス**: 運用者と要相談 (ルータ機種次第)
+
+### ODD-W02: 動的 IP / DDNS
+- **選択肢**: A. 固定 IP 契約 / B. Cloudflare DDNS / C. duckdns / D. no-ip
+- **推奨**: 既存契約に依存
+- **ステータス**: 運用者と要相談
+
+### ODD-W03: Full Tunnel vs Split Tunnel
+- **選択肢**: A. Full Tunnel のみ / B. 両プロファイル提供
+- **推奨**: B (Full = セキュリティ、Split = 自宅回線負荷軽減)
+- **ステータス**: 議論中
+
+### ODD-W04: 鍵管理の自動化レベル
+- **選択肢**: A. 手動配布 / B. LDAP 属性 + admin スクリプト / C. wg-portal 等の管理 UI
+- **推奨**: 利用者数次第。3 人以下なら A、それ以上なら B
+- **ステータス**: 議論中
+
+---
+
+## 13. 参考資料
+
+- [WireGuard Official](https://www.wireguard.com/)
+- [WireGuard Whitepaper](https://www.wireguard.com/papers/wireguard.pdf)
+- [wg-easy](https://github.com/wg-easy/wg-easy)
+- [Cloudflare DDNS Worker](https://github.com/cloudflare/templates)
+
+---
+
+## 14. レビュー履歴
 
 | 日付 | 版 | 変更点 |
 |------|----|--------|
 | 2026-05-29 | v0.1 | モジュール分離に伴う初版 |
+| 2026-05-29 | v0.2 | 公開品質向上 (Mermaid 図、Open Design Decisions、参考資料) |

@@ -25,13 +25,46 @@
 
 ## 3. 認証方式
 
-| # | 方式 | 利用シーン | Kerberos 結合 |
-|---|------|-----------|--------------|
-| 1 | パスワード | リモート SSH、フォールバック | 標準 preauth (ENC-TIMESTAMP) |
-| 2 | 指紋 | デスクトップ / ノート PC ロック解除 | Windows Hello / fprintd が TPM 内キャッシュをアンロック → PAM が裏で `kinit` |
-| 3 | YubiKey | 高セキュリティ、リモート強認証 | PIV X.509 証明書による **PKINIT** (Kerberos 標準) |
+3 つの方式をサポートし、利用者は環境に応じて使い分け / 組み合わせ可能。
 
-> 指紋は **ローカルアンロック手段**。データはネットワークに出ない。
+| # | 方式 | 利用シーン | Kerberos との結合 |
+|---|------|-----------|------------------|
+| 1 | **パスワード** | リモート SSH、サーバ初期セットアップ、フォールバック | 標準 Kerberos preauth (ENC-TIMESTAMP) |
+| 2 | **指紋** | デスクトップ / ノート PC ロック解除 | Windows Hello / fprintd が TPM 内キャッシュをアンロック → PAM 経由で `kinit` |
+| 3 | **ハードウェアセキュリティキー** | 高セキュリティ、リモート強認証、MFA | 採用モデルにより 2 つの結合方式 (下記 §3.1 参照) |
+
+> 指紋は **ローカルアンロック手段**。データはネットワークに出ない。Kerberos プロトコル自体は指紋を理解しないため「指紋でローカル PAM を通過 → 裏で `kinit`」の構図になる。
+
+### 3.1 ハードウェアキーの結合方式
+
+ハードウェアキーには大きく 2 系統があり、それぞれ Kerberos との結合方式が異なる。**採用するキーの種別によって設計が分岐** する。
+
+| 系統 | 代表的な機能 | Kerberos 結合 | 必要条件 |
+|------|------------|--------------|---------|
+| **A. PIV (スマートカード) 対応キー** | X.509 証明書を内蔵チップに格納、PKCS#11 経由で利用 | **PKINIT** (Kerberos 標準、RFC 4556) | キーが PIV applet を実装、CA の整備 |
+| **B. FIDO2 / WebAuthn 専用キー** | 公開鍵チャレンジレスポンス、PIN + ユーザ存在証明 | **間接結合** (下記参照) | キーが FIDO2 / U2F を実装 |
+
+#### A. PIV / PKINIT 経路 (直接結合)
+- Windows: スマートカードログオン (`certutil -dspublish` で AD NTAuth に CA 登録)
+- Linux: `kinit -X X509_user_identity=PKCS11:...` で TGT 取得
+- 失効: CA で証明書失効 → CRL / OCSP 反映
+- ◎ Kerberos プロトコルにネイティブ統合
+- △ CA 構築 / 証明書ライフサイクル管理が必要
+
+#### B. FIDO2 経路 (間接結合)
+FIDO2 は Kerberos プロトコルが直接サポートしないため、以下のいずれかでブリッジする:
+
+| 経路 | 仕組み | 適用範囲 |
+|------|-------|---------|
+| **B-1. PAM + pam-u2f / libfido2** | PAM 認証成功後に保存資格情報で `kinit` を実行 | Linux ローカルログオン / SSH |
+| **B-2. SSH FIDO2 鍵** (`ed25519-sk`) | OpenSSH ネイティブ。Kerberos バイパス | SSH 専用 (Kerberos 統合せず) |
+| **B-3. WebAuthn → OIDC ブリッジ** | Keycloak / Authentik 経由で FIDO2 → SAML/OIDC → Kerberos | Web サービス |
+| **B-4. Windows Hello for Business** | FIDO2 → Entra ID → AD ハイブリッド | Entra ID 連携前提 (本 homelab スコープ外) |
+
+#### 設計上の含意
+- **PIV 系を採用する場合**: 本書の機能要件 FR-09 (`kinit -X`) / FR-12 (管理者 PIV 必須) がそのまま適用可能。CA (step-ca) が必須。
+- **FIDO2 系を採用する場合**: FR-09 は B-1 (PAM 経由 kinit) に読み替え。CA は不要だが、PAM 設定とフォールバック設計を厳密に行う必要がある。Web サービスへの拡張は Phase 5 で別途検討。
+- **両系統を混在運用する場合**: ユーザ単位で方式を選べるよう PAM / kadm5.acl を分岐させる。
 
 ## 4. スコープ
 
@@ -45,10 +78,11 @@
 | S5 | Linux クライアント統合 | SSSD で Fedora / WSL Ubuntu を join |
 | S6 | Windows クライアント統合 | ネイティブドメイン参加 |
 | S7 | バックアップ | DB / LDAP / keytab の日次バックアップ |
-| S8 | PKI | step-ca による CA 構築 (KDC / クライアント証明書) |
-| S9 | PKINIT 有効化 | YubiKey からの TGT 取得 |
+| S8 | PKI (PIV 採用時) | step-ca による CA 構築 (KDC / クライアント証明書) |
+| S9 | PKINIT (PIV 採用時) | ハードウェアキーからの TGT 取得経路 |
+| S9' | PAM 経由 kinit (FIDO2 採用時) | pam-u2f / libfido2 → kinit ラッパー |
 | S10 | 指紋連携 | Windows Hello / fprintd の PAM 設定 |
-| S11 | MFA ポリシー | 管理者は YubiKey 必須 |
+| S11 | MFA ポリシー | 管理者にハードウェアキー認証を強制可能 |
 
 ### 4.2 Out of Scope (将来 Phase へ)
 - マルチ KDC / セカンダリ DC (HA)
@@ -75,21 +109,20 @@
 
 ## 6. 想定アーキテクチャ
 
-```
-┌────────────────────────────────────────────────────────┐
-│ 家庭 LAN                                                │
-│                                                         │
-│  ┌─────────────┐    ┌──────────────────────────────┐   │
-│  │ Windows     │    │ TS-233 (Container Station)   │   │
-│  │ - ドメイン参加 │◀──▶│ ┌────────────┐ ┌──────────┐│   │
-│  └─────────────┘    │ │ Samba AD DC│ │ step-ca  ││   │
-│                      │ │  - Kerberos│ │  (PKI)   ││   │
-│  ┌─────────────┐    │ │  - LDAP    │ └──────────┘│   │
-│  │ Fedora CoreOS│◀───┤ │  - DNS     │              │   │
-│  │ - SSSD       │    │ │  - chrony  │              │   │
-│  └─────────────┘    │ └────────────┘              │   │
-│                      └──────────────────────────────┘   │
-└────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph LAN["家庭 LAN"]
+        Win["Windows PC<br/>(ドメイン参加)"]
+        FCOS["Fedora CoreOS<br/>(SSSD)"]
+        subgraph TS233["QNAP TS-233 (ARM64, 2GB)"]
+            Samba["Samba AD DC<br/>Kerberos / LDAP / DNS / chrony"]
+            StepCA["step-ca<br/>(PIV 採用時のみ)"]
+        end
+    end
+    Win <-->|"Kerberos auth"| Samba
+    FCOS <-->|"Kerberos auth"| Samba
+    Win -. "smartcard logon<br/>(PIV)" .-> StepCA
+    FCOS -. "PKINIT<br/>(PIV)" .-> StepCA
 ```
 
 ## 7. 機能要件
@@ -103,12 +136,12 @@
 | FR-05 | ユーザ追加 CLI/GUI | `samba-tool user add` および RSAT で成功 |
 | FR-06 | GSSAPI SSH | `kinit` 後 `ssh -K` 成功 |
 | FR-07 | ホームディレクトリ自動作成 | mkhomedir で初回ログイン時に作成 |
-| FR-08 | YubiKey で Win ログオン | PIV スマートカードログオン成功 |
-| FR-09 | YubiKey で kinit | `kinit -X X509_user_identity=PKCS11:...` で TGT 取得 |
+| FR-08 | ハードウェアキーで Win ログオン | (PIV) スマートカードログオン成功 / (FIDO2) WebAuthn ログオン成功 |
+| FR-09 | ハードウェアキーで Linux ログオン → TGT 取得 | (PIV) `kinit -X X509_user_identity=PKCS11:...` / (FIDO2) PAM 通過後 `kinit` 実行 |
 | FR-10 | 指紋で Win サインイン | Windows Hello → 裏で TGT 取得 |
 | FR-11 | 指紋で Linux ログオン | fprintd → PAM 経由 kinit で TGT 取得 |
-| FR-12 | 管理者 YubiKey 必須 | `admin@HOME.LAB` はパスワードのみ不可 |
-| FR-13 | YubiKey 失効 | CA で証明書失効 → CRL/OCSP 反映、KDC が拒否 |
+| FR-12 | 管理者にハードウェアキー必須化可能 | パスワードのみでの TGT 取得不可ポリシー |
+| FR-13 | ハードウェアキー失効 | (PIV) 証明書失効 → CRL/OCSP / (FIDO2) credential ID を AD 属性から削除 |
 
 ## 8. 非機能要件
 
@@ -122,10 +155,10 @@
 | NFR-06 | セキュリティ | AES256-CTS-HMAC-SHA1-96 を最低限、RC4/DES 無効 |
 | NFR-07 | 監査 | ログオン成功/失敗を 30 日保存 |
 | NFR-08 | 運用 | 全設定 Git 管理、IaC で再現可能 |
-| NFR-09 | PKI 有効期間 | KDC=1 年、ユーザ=90 日 (短命) |
-| NFR-10 | YubiKey | PIV PIN 8 桁以上、3 回失敗ロック |
-| NFR-11 | 指紋 | テンプレートはローカル TPM 内に閉じる |
-| NFR-12 | リボーク | 紛失報告 ≤ 1 時間で証明書失効、CRL 配布 30 分間隔 |
+| NFR-09 | PKI 有効期間 (PIV 採用時) | KDC=1 年、ユーザ証明書=90 日 (短命) |
+| NFR-10 | ハードウェアキー PIN | 8 桁以上、3 回失敗でロック |
+| NFR-11 | 指紋 | テンプレートはローカル TPM / Secure Enclave 内に閉じる |
+| NFR-12 | リボーク所要時間 | 紛失報告 ≤ 1 時間で失効反映 (PIV: CRL 配布 30 分間隔 / FIDO2: AD 属性即時削除) |
 
 ## 9. 認証フロー
 
@@ -140,11 +173,18 @@ User → Client PAM → (AS-REQ + PA-ENC-TIMESTAMP) → KDC
 指紋 → TPM/Secure Enclave → 保護パスワード解放 → PAM が裏で AS-REQ → TGT
 ```
 
-### YubiKey (PKINIT)
+### ハードウェアキー — PIV / PKINIT (採用パターン A)
 ```
-PIN → YubiKey PIV 9a 秘密鍵で署名
-   → AS-REQ (PA-PK-AS-REQ, 証明書同梱)
+PIN → PIV applet スロット 9a 秘密鍵で署名
+   → AS-REQ (PA-PK-AS-REQ, クライアント証明書同梱)
    → KDC が CA 信頼 + CRL 確認 → TGT
+```
+
+### ハードウェアキー — FIDO2 (採用パターン B)
+```
+PIN + Touch → FIDO2 チャレンジ署名
+   → PAM (pam-u2f / libfido2) が AD 属性内の credential ID で検証
+   → 認証成功後、PAM 設定により kinit (保存パスワード or kcm) → TGT
 ```
 
 ## 10. 制約と前提
@@ -165,11 +205,12 @@ PIN → YubiKey PIV 9a 秘密鍵で署名
 | R4 | Win ドメイン参加でプロファイル消失 | 事前バックアップ / 移行手順 |
 | R5 | QNAP Container Station ネットワーク制約 | host or macvlan で固定 IP、PoC 検証 |
 | R6 | ARM64 Samba 動作不確実 | PoC で smoke test (`samba-tool domain provision`) |
-| R7 | YubiKey 紛失 → 締め出し | バックアップ YubiKey 1 本、リカバリパスワードを紙で金庫保管 |
-| R8 | CA 秘密鍵漏洩 | root key は HSM or オフライン、intermediate のみオンライン |
-| R9 | 指紋センサ故障 | パスワード / YubiKey フォールバック維持 |
-| R10 | PKINIT 設定ミスで全員ロックアウト | `kadmin.local` ローカル経路を残す |
-| R11 | Win スマートカード NTAuth 未登録 | `certutil -dspublish` を構築手順に必須化 |
+| R7 | ハードウェアキー紛失 → 締め出し | バックアップキー 1 本必須、リカバリパスワードを紙で金庫保管 |
+| R8 | CA 秘密鍵漏洩 (PIV 採用時) | root key は HSM or オフライン保管、intermediate のみオンライン |
+| R9 | 指紋センサ故障 | パスワード / ハードウェアキーへフォールバック維持 |
+| R10 | PKINIT/PAM 設定ミスで全員ロックアウト | `kadmin.local` ローカル経路 + パスワードフォールバックを残す |
+| R11 | Win スマートカード NTAuth 未登録 (PIV 採用時) | `certutil -dspublish` を構築手順に必須化 |
+| R12 | 採用キーが期待した方式に非対応 | 調達前に PIV / FIDO2 対応状況を確認する手順を Runbook 化 |
 
 ## 12. モジュール固有の設計パラメータ
 
@@ -181,10 +222,10 @@ PIN → YubiKey PIV 9a 秘密鍵で署名
 | 初期ユーザ | TBD | ✓ TBD-4 |
 | バックアップ保管先 | TBD (TS-233 内 / 外付け USB / クラウド) | ✓ TBD-5 |
 | WSL2 を AD 参加させるか | TBD | ✓ TBD-6 |
-| YubiKey 型番 | TBD (5C NFC / 5 Bio 等) | ✓ TBD-7 |
-| YubiKey 本数 | プライマリ + バックアップ = 2 本/人 想定 | ✓ TBD-8 |
-| CA 配置 | TBD (TS-233 / Windows ホスト / 別建て) | ✓ TBD-9 |
-| パスワード認証廃止 | TBD (フォールバック維持 or MFA 強制) | ✓ TBD-10 |
+| ハードウェアキー モデル | (運用者が選定、要件次第で PIV 対応モデル or FIDO2 専用モデル) | ✓ |
+| ハードウェアキー 本数 | プライマリ + バックアップ = 2 本/人 推奨 | |
+| CA 配置 | (運用者が決定) | ✓ |
+| パスワード認証廃止 | (運用者が決定: フォールバック維持 or MFA 強制) | ✓ |
 
 ## 13. Kerberize 可能な周辺機能 (将来取り込み)
 
@@ -224,6 +265,18 @@ KDC を立てると **同じ ID で透過的に使える** ようになる機能
 
 Phase 5 候補: K-04 (Web SSO), K-20 (各 Web アプリ統合)
 
+## 13.5 参考資料
+
+- [Samba AD DC HOWTO](https://wiki.samba.org/index.php/Setting_up_Samba_as_an_Active_Directory_Domain_Controller)
+- [SSSD Documentation](https://sssd.io/docs/)
+- [PKINIT RFC 4556](https://www.rfc-editor.org/rfc/rfc4556)
+- [step-ca documentation](https://smallstep.com/docs/step-ca/)
+- [FIDO2 Specification (W3C WebAuthn)](https://www.w3.org/TR/webauthn-2/)
+- [pam-u2f](https://github.com/Yubico/pam-u2f)
+- [OpenSSH FIDO/U2F (`ed25519-sk`)](https://www.openssh.com/txt/release-8.2)
+
+---
+
 ## 14. 成果物 (Phase 2 完了時)
 
 - 本 `docs/requirements.md`
@@ -235,11 +288,59 @@ Phase 5 候補: K-04 (Web SSO), K-20 (各 Web アプリ統合)
 - `clients/linux/{realm-join,setup-fprintd,ssh-gssapi}.sh`
 - `clients/yubikey/provision-piv.sh`
 
-## 15. レビュー履歴
+## 15. Open Design Decisions
+
+未確定の設計判断。各項目は **選択肢 / 推奨 / 理由 / ステータス** の形で記録する。
+
+### ODD-K01: KDC バックエンド選定
+- **選択肢**: A. Samba AD DC / B. FreeIPA / C. MIT Kerberos + OpenLDAP
+- **推奨**: A. Samba AD DC + step-ca (PIV 採用時)
+- **理由**: Windows ネイティブドメイン参加、TS-233 ARM64 / 2GB RAM での現実性
+- **ステータス**: 推奨提示済、承認待ち
+
+### ODD-K02: ハードウェアキー方式
+- **選択肢**: A. PIV/PKINIT 系 / B. FIDO2 系 / C. 両系統混在
+- **推奨**: 採用するキー型番により決定 (§3.1 参照)
+- **理由**: 結合方式とライフサイクル管理が大きく異なる
+- **ステータス**: キー選定待ち
+
+### ODD-K03: パスワード認証の扱い
+- **選択肢**: A. フォールバックとして維持 / B. 全ユーザ MFA 強制 / C. 管理者のみ MFA 強制
+- **推奨**: C (運用初期はロックアウトリスク高)
+- **理由**: 自宅運用で全員 MFA 強制は復旧経路を狭める
+- **ステータス**: 議論中
+
+### ODD-K04: CA 配置 (PIV 採用時)
+- **選択肢**: A. TS-233 同居 / B. 別ホスト / C. オフライン root + オンライン intermediate
+- **推奨**: C (root はオフライン、intermediate のみ TS-233)
+- **理由**: root 鍵漏洩リスクを最小化
+- **ステータス**: 運用者と要相談
+
+### ODD-K05: LAN サブネット / IP プラン
+- **ステータス**: 運用者と要相談 (本書には記載しない)
+
+### ODD-K06: バックアップ保管先
+- **選択肢**: A. TS-233 内部 / B. 外付け USB / C. 暗号化してクラウド
+- **推奨**: A + B 併用 (Phase 6 で C 追加)
+- **ステータス**: 議論中
+
+### ODD-K07: 初期ユーザ一覧
+- **ステータス**: 運用者が個別に管理 (本書には記載しない)
+
+### ODD-K08: WSL2 を AD 参加させるか
+- **選択肢**: A. 参加させる / B. ホスト Windows のチケットを共有 / C. 独立運用
+- **推奨**: B (利便性とシンプルさのバランス)
+- **理由**: WSL2 内の sssd 運用は WSL の systemd 制約で扱いにくい
+- **ステータス**: 議論中
+
+---
+
+## 16. レビュー履歴
 
 | 日付 | 版 | 変更点 |
 |------|----|--------|
 | 2026-05-29 | v0.1 | 初版ドラフト |
-| 2026-05-29 | v0.2 | 認証方式 (パスワード/指紋/YubiKey) + MFA + CA/PKINIT |
-| 2026-05-29 | v0.3 | §13 Kerberize 可能機能カタログ |
+| 2026-05-29 | v0.2 | 認証方式 (パスワード/指紋/ハードウェアキー) + MFA + PKI |
+| 2026-05-29 | v0.3 | §13 Kerberize 可能機能カタログ追加 |
 | 2026-05-29 | v0.4 | モジュール分離 (`modules/kerberos/`) |
+| 2026-05-29 | v0.5 | 公開品質向上: §3.1 ハードウェアキー方式の選択肢化 (PIV / FIDO2)、§15 Open Design Decisions 構造化 |

@@ -56,28 +56,26 @@
 
 ## 5. アーキテクチャ
 
+```mermaid
+flowchart TB
+    NewHW["新規 / 故障マシン"]
+    subgraph TS233["QNAP TS-233 (Container Station)"]
+        DHCP["dnsmasq<br/>(proxyDHCP)"]
+        TFTP["tftpd<br/>(iPXE 配信)"]
+        HTTP["nginx<br/>(カーネル / WIM)"]
+        Tpl["Ignition / Unattend<br/>テンプレート"]
+    end
+    KDC["Kerberos KDC<br/>(同 TS-233 上 / 別ホスト)"]
+
+    NewHW -- "PXE 要求" --> DHCP
+    NewHW -- "iPXE DL" --> TFTP
+    NewHW -- "OS イメージ DL" --> HTTP
+    NewHW -- "初期設定 fetch" --> Tpl
+    Tpl -. "CA 公開鍵 + KDC ホスト名" .-> NewHW
+    NewHW -- "起動後 realm join" --> KDC
 ```
-[新規 / 故障マシン]
-    │ PXE Boot
-    ▼
-┌────────────────────────────────────────┐
-│ TS-233 (Container Station)              │
-│ ┌──────────┐ ┌──────────┐ ┌──────────┐│
-│ │ dnsmasq  │ │ tftpd    │ │ nginx    ││
-│ │ (proxy   │ │ (iPXE    │ │ (HTTP    ││
-│ │  DHCP)   │ │  配信)   │ │  カーネル││
-│ └──────────┘ └──────────┘ │  WIM 等) ││
-│                            └──────────┘│
-│ ┌────────────────────────────────────┐│
-│ │ Ignition / Unattend テンプレート   ││
-│ │  (KDC ホスト名, CA 証明書を埋込)   ││
-│ └────────────────────────────────────┘│
-└────────────────────────────────────────┘
-    │
-    ▼
-[Kerberos KDC = 同 TS-233 上 (kerberos モジュール)]
-(初回ブート時に realm join / smartcard 登録)
-```
+
+> 初回ブート時に Ignition (FCOS) / unattend (Windows) が自動で realm join とハードウェアキー登録を行う。
 
 ## 6. 機能要件
 
@@ -135,8 +133,49 @@
 - `unattend/windows-autounattend.xml`
 - `docs/runbook.md` (運用 / Secure Boot 設定 / トラブルシュート)
 
-## 11. レビュー履歴
+## 11. Open Design Decisions
+
+### ODD-P01: PXE 配信スタックの選定
+- **選択肢**: A. netboot.xyz ベース / B. MAAS / C. Foreman + Cobbler
+- **推奨**: A (TS-233 ARM64 / 軽量 / Win 配信可)
+- **ステータス**: 推奨提示済
+
+### ODD-P02: Secure Boot サポート方針
+- **選択肢**: A. shim 経由 (Fedora 公式署名) / B. 自前 MOK 登録 / C. Secure Boot 無効化
+- **推奨**: A (運用負荷最小)
+- **ステータス**: 議論中
+
+### ODD-P03: Windows ライセンス認証
+- **選択肢**: A. KMS サーバ自前運用 / B. プロダクトキー直接認証 / C. デジタルライセンス
+- **推奨**: 利用台数次第。3 台以下なら B、それ以上なら A 検討
+- **ステータス**: 運用者と要相談
+
+### ODD-P04: 既存 DHCP との共存
+- **選択肢**: A. proxyDHCP モード / B. PXE 用 VLAN 分離 / C. 既存 DHCP を置換
+- **推奨**: A (家庭ルータの DHCP を温存)
+- **ステータス**: 推奨提示済
+
+### ODD-P05: イメージミラー保管先
+- **選択肢**: A. TS-233 内のみ / B. 外付け USB に冗長化 / C. クラウド
+- **推奨**: A + B (TS-233 障害時の復旧経路確保)
+- **ステータス**: 議論中
+
+---
+
+## 12. 参考資料
+
+- [iPXE Documentation](https://ipxe.org/docs)
+- [netboot.xyz](https://netboot.xyz/)
+- [Fedora CoreOS PXE Boot](https://docs.fedoraproject.org/en-US/fedora-coreos/bare-metal/)
+- [Butane (Ignition 入力)](https://coreos.github.io/butane/)
+- [wimboot (Windows PXE)](https://ipxe.org/wimboot)
+- [Windows Autounattend.xml Reference](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/unattend/)
+
+---
+
+## 13. レビュー履歴
 
 | 日付 | 版 | 変更点 |
 |------|----|--------|
 | 2026-05-29 | v0.1 | モジュール分離に伴う初版 |
+| 2026-05-29 | v0.2 | 公開品質向上 (Mermaid 図、Open Design Decisions、参考資料) |
